@@ -46,9 +46,13 @@ def run_loop(local_rank, config_file=None, saved=True, extra_args=[]):
 
     # configurations initialization
     config = Config(config_file_list=config_file)
+    print(f"config {config}")
+    input()
 
     device = torch.device("cuda", local_rank)
     config['device'] = device
+
+    # 加载运行的时候的 配置信息，比如使用什么模型什么的
     if len(extra_args):
         for i in range(0, len(extra_args), 2):
             key = extra_args[i][2:]

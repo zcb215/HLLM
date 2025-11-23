@@ -116,6 +116,8 @@ class Data:
 
         for index in grouped_index.values():
             indices.extend(list(index)[:-2])
+
+        # 这里获取的train_feat数据是一句 indices的数据得到的，前面是排序的数据，这里又是分类的插入，所以最终的数据是即分类又排序的
         for k in self.inter_feat:
             train_feat[k] = self.inter_feat[k].values[indices]
 
