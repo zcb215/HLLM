@@ -152,9 +152,13 @@ def run_loop(local_rank, config_file=None, saved=True, extra_args=[]):
     logger.info(set_color('\nWorld_Size', 'pink') + f' = {world_size} \n')
     logger.info(config)
     logger.info(dataload)
+    logger.info('model structure:')
     logger.info(model)
+    # input()   # 到这里显存使用都不大
 
+    # 典型的机器学习模型训练和评估流程
     if config['val_only']:
+        # 只进行模型评估，不训练
         ckpt_path = os.path.join(config['checkpoint_dir'], 'pytorch_model.bin')
         ckpt = torch.load(ckpt_path, map_location='cpu')
         logger.info(f'Eval only model load from {ckpt_path}')

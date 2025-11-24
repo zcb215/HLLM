@@ -20,13 +20,13 @@ import torch.distributed as dist
 from tqdm import tqdm
 import deepspeed
 
-from REC.data.dataset import BatchTextDataset
-from REC.data.dataset.collate_fn import customize_rmpad_collate
+from ..data.dataset import BatchTextDataset
+from ..data.dataset.collate_fn import customize_rmpad_collate
 from torch.utils.data import DataLoader
-from REC.evaluator import Evaluator, Collector
-from REC.utils import ensure_dir, get_local_time, early_stopping, calculate_valid_score, dict2str, \
+from ..evaluator import Evaluator, Collector
+from ..utils import ensure_dir, get_local_time, early_stopping, calculate_valid_score, dict2str, \
     get_tensorboard, set_color, get_gpu_usage, WandbLogger
-from REC.utils.lr_scheduler import *
+from ..utils.lr_scheduler import *
 
 import lightning as L
 from lightning.fabric.strategies import DeepSpeedStrategy, DDPStrategy
@@ -37,23 +37,25 @@ class Trainer(object):
         super(Trainer, self).__init__()
         self.config = config
         self.model = model
-        self.logger = getLogger(self.__class__.__name__)
+        self.logger = getLogger()
 
         self.wandblogger = WandbLogger(config)
 
         self.optim_args = config['optim_args']
         self.epochs = config['epochs']
         self.eval_step = min(config['eval_step'], self.epochs)
+        #早停（Early Stopping)
         self.stopping_step = config['stopping_step']
+        #防止梯度爆炸，将梯度范数限制在指定范围内
         self.clip_grad_norm = config.get('clip_grad_norm', 1.0)
         self.valid_metric = config['valid_metric'].lower()
         self.valid_metric_bigger = config['valid_metric_bigger']
         self.test_batch_size = config['eval_batch_size']
         self.gpu_available = torch.cuda.is_available() and config['use_gpu']
         self.device = config['device']
-
+        # 获取当前进程在分布式训练中的排名
         self.rank = torch.distributed.get_rank()
-
+        #只在rank 0进程初始化TensorBoard
         if self.rank == 0:
             self.tensorboard = get_tensorboard(self.logger)
 
@@ -74,15 +76,19 @@ class Trainer(object):
         self.optimizer = self._build_optimizer()
         self.update_interval = config['update_interval'] if config['update_interval'] else 20
         self.scheduler_config = config['scheduler_args']
+
+        #根据配置冻结指定前缀的参数
         if config['freeze_prefix'] or config['freeze_ad']:
             freeze_prefix = config['freeze_prefix'] if config['freeze_prefix'] else []
             if config['freeze_ad']:
                 freeze_prefix.extend(['item_llm', 'item_emb_tokens'])
             if not config['ft_item']:
+                #冻结适配器参数
                 freeze_prefix.extend(['item_embedding'])
-
+            #实际执行参数冻结操作，遍历模型参数并冻结匹配前缀的参数
             self._freeze_params(freeze_prefix)
 
+        #记录所有参数的名称、大小和梯度状态
         for n, p in self.model.named_parameters():
             self.logger.info(f"{n} {p.size()} {p.requires_grad}")
 
@@ -91,6 +97,7 @@ class Trainer(object):
         self.item_feature = None
         self.tot_item_num = None
 
+    #冻结指定前缀的模型参数
     def _freeze_params(self, freeze_prefix):
         for name, param in self.model.named_parameters():
             for prefix in freeze_prefix:
@@ -98,6 +105,7 @@ class Trainer(object):
                     self.logger.info(f"freeze_params: {name}")
                     param.requires_grad = False
 
+    #根据配置构建学习率调度器 支持三种调度器：余弦退火、线性衰减、常数学习率
     def _build_scheduler(self, warmup_steps=None, tot_steps=None):
         if self.scheduler_config['type'] == 'cosine':
             self.logger.info(f"Use consine scheduler with {warmup_steps} warmup {tot_steps} total steps")
@@ -108,37 +116,58 @@ class Trainer(object):
         else:
             self.logger.info(f"Use constant scheduler")
             return get_constant_schedule(self.optimizer)
-
+    #？
     def _build_optimizer(self):
         if len(self.optim_args) == 4:
             params = self.model.named_parameters()
-            modal_params = []
-            recsys_params = []
-            modal_decay_params = []
-            recsys_decay_params = []
+            modal_params = []  # 视觉模态相关参数
+            recsys_params = []  # 推荐系统核心参数
+            modal_decay_params = []  # 模态衰减参数
+            recsys_decay_params = []  # 推荐系统衰减参数
             decay_check_name = self.config['decay_check_name']
             for index, (name, param) in enumerate(params):
                 if param.requires_grad:
+                    # 第一级分类：基于参数名称
                     if 'visual_encoder' in name:
-                        modal_params.append(param)
+                        modal_params.append(param)  # 视觉编码器相关参数
                     else:
-                        recsys_params.append(param)
+                        recsys_params.append(param)  # 其他所有参数
+
+                    # 第二级分类：基于衰减检查名称
                     if decay_check_name:
                         if decay_check_name in name:
-                            modal_decay_params.append(param)
+                            modal_decay_params.append(param)  # 需要特殊衰减的参数
                         else:
-                            recsys_decay_params.append(param)
+                            recsys_decay_params.append(param)  # 普通衰减的参数
+
             if decay_check_name:
+                # 使用细粒度的衰减分组
                 optimizer = optim.AdamW([
-                    {'params': modal_decay_params, 'lr': self.optim_args['modal_lr'], 'weight_decay': self.optim_args['modal_decay']},
-                    {'params': recsys_decay_params, 'lr': self.optim_args['rec_lr'], 'weight_decay': self.optim_args['rec_decay']}
+                    {
+                        'params': modal_decay_params,
+                        'lr': self.optim_args['modal_lr'],
+                        'weight_decay': self.optim_args['modal_decay']
+                    },
+                    {
+                        'params': recsys_decay_params,
+                        'lr': self.optim_args['rec_lr'],
+                        'weight_decay': self.optim_args['rec_decay']
+                    }
                 ])
                 optim_output = set_color(f'recsys_decay_params_len: {len(recsys_decay_params)}  modal_params_decay_len: {len(modal_decay_params)}', 'blue')
                 self.logger.info(optim_output)
             else:
                 optimizer = optim.AdamW([
-                    {'params': modal_params, 'lr': self.optim_args['modal_lr'], 'weight_decay': self.optim_args['modal_decay']},
-                    {'params': recsys_params, 'lr': self.optim_args['rec_lr'], 'weight_decay': self.optim_args['rec_decay']}
+                    {
+                        'params': modal_params,
+                        'lr': self.optim_args['modal_lr'],
+                        'weight_decay': self.optim_args['modal_decay']
+                    },
+                    {
+                        'params': recsys_params,
+                        'lr': self.optim_args['rec_lr'],
+                        'weight_decay': self.optim_args['rec_decay']
+                    }
                 ])
                 optim_output = set_color(f'recsys_lr_params_len: {len(recsys_params)}  modal_lr_params_len: {len(modal_params)}', 'blue')
                 self.logger.info(optim_output)
@@ -176,6 +205,7 @@ class Trainer(object):
         self.model.train()
         total_loss = 0
         if self.rank == 0:
+            # 只有主进程显示进度条（分布式训练）
             pbar = tqdm(
                 total=len(train_data),
                 miniters=self.update_interval,
@@ -190,6 +220,7 @@ class Trainer(object):
             data_time = t.time()
             losses = self.model(data)
             fwd_time = t.time()
+            #特殊损失处理（NCE损失） 噪声对比估计损失，是一种用于训练模型区分真实数据和噪声数据的损失函数
             if self.config['loss'] and self.config['loss'] == 'nce':
                 model_out = losses
                 losses = model_out.pop('loss')
@@ -201,12 +232,16 @@ class Trainer(object):
             if self.scheduler_config:
                 self.lr_scheduler.step()
             if show_progress and self.rank == 0 and batch_idx % self.update_interval == 0:
+                # 构建进度信息
                 msg = f"loss: {losses:.4f} data: {data_time-start_time:.3f} fwd: {fwd_time-data_time:.3f} bwd: {bwd_time-fwd_time:.3f}"
                 if self.scheduler_config:
+                    # 添加学习率信息
                     msg = f"lr: {self.lr_scheduler.get_lr()[0]:.7f} " + msg
                 if self.config['loss'] and self.config['loss'] == 'nce':
+                    # 添加NCE损失的子损失信息
                     for k, v in model_out.items():
-                        msg += f" {k}: {v:.3f}"
+                        if k.endswith('loss'):
+                            msg += f" {k}: {v:.3f}"
                 if grad_norm:
                     msg = msg + f" grad_norm: {grad_norm.sum():.4f}"
                 pbar.set_postfix_str(msg, refresh=False)
@@ -218,12 +253,14 @@ class Trainer(object):
         return total_loss
 
     def _valid_epoch(self, valid_data, show_progress=False):
+        #分布式同步屏障
         torch.distributed.barrier()
         valid_result = self.evaluate(valid_data, load_best_model=False, show_progress=show_progress)
+        #计算验证分数
         valid_score = calculate_valid_score(valid_result, self.valid_metric)
         torch.distributed.barrier()
         return valid_score, valid_result
-
+    #保存模型、优化器、配置等完整训练状态 记录随机数状态以保证可复现性 在分布式环境中只由主进程执行保存操作 提供详细的日志记录
     def _save_checkpoint(self, epoch, verbose=True):
         r"""Store the model parameters information and training information.
 
@@ -250,10 +287,13 @@ class Trainer(object):
         if torch.isnan(loss):
             raise ValueError('Training loss is nan')
 
+    #输出训练中的损失
     def _generate_train_loss_output(self, epoch_idx, s_time, e_time, losses):
+        #从配置中获取损失值显示的小数位数，如果没有配置则默认为4位
         des = self.config['loss_decimal_place'] or 4
         train_loss_output = (set_color('epoch %d training', 'green') + ' [' + set_color('time', 'blue') +
                              ': %.2fs, ') % (epoch_idx, e_time - s_time)
+        #多损失情况处理
         if isinstance(losses, tuple):
             des = (set_color('train_loss%d', 'blue') + ': %.' + str(des) + 'f')
             train_loss_output += ', '.join(des % (idx + 1, loss) for idx, loss in enumerate(losses))
@@ -293,6 +333,7 @@ class Trainer(object):
 
         self.tensorboard.add_hparams(hparam_dict, {'hparam/best_valid_result': best_valid_result})
 
+    #不同类型的数据输入设备的方式 现在无需区分是什么类型的数据了，这里 todevice重写
     def to_device(self, data):
         device = self.device
         if isinstance(data, tuple) or isinstance(data, list):
@@ -310,14 +351,17 @@ class Trainer(object):
 
     def fit(self, train_data, valid_data=None, verbose=True, saved=True, show_progress=False, callback_fn=None):
         if self.scheduler_config:
+            #学习率调度器设置
             warmup_rate = self.scheduler_config.get('warmup', 0.001)
             tot_steps = len(train_data) * self.epochs
             warmup_steps = tot_steps * warmup_rate
             self.lr_scheduler = self._build_scheduler(warmup_steps=warmup_steps, tot_steps=tot_steps)
 
+        #分布式训练初始化
         world_size, local_world_size = int(os.environ['WORLD_SIZE']), int(os.environ['LOCAL_WORLD_SIZE'])
         nnodes = world_size // local_world_size
         precision = self.config['precision'] if self.config['precision'] else '32'
+        #分布式的策略
         if self.config['strategy'] == 'deepspeed':
             self.logger.info(f"Use deepspeed strategy")
             strategy = DeepSpeedStrategy(stage=self.config["stage"], precision=precision)
@@ -329,11 +373,13 @@ class Trainer(object):
         self.lite.launch()
         self.model, self.optimizer = self.lite.setup(self.model, self.optimizer)
 
+        #自动恢复机制
         if self.config['auto_resume']:
             raise NotImplementedError
 
         valid_step = 0
 
+        #主训练循环
         for epoch_idx in range(self.start_epoch, self.epochs):
             # train
             if self.config['need_training'] == None or self.config['need_training']:
@@ -349,14 +395,17 @@ class Trainer(object):
                 if self.rank == 0:
                     self._add_train_loss_to_tensorboard(epoch_idx, train_loss)
                 self.wandblogger.log_metrics({'epoch': epoch_idx, 'train_loss': train_loss, 'train_step': epoch_idx}, head='train')
-
+            #验证和早停机制
             if self.eval_step <= 0 or not valid_data:
                 if saved:
                     self._save_checkpoint(epoch_idx, verbose=verbose)
                 continue
+            #控制验证频率，避免每个epoch都验证
+            #示例：如果eval_step = 5，则在epoch 4, 9, 14...时进行验证
             if (epoch_idx + 1) % self.eval_step == 0:
                 valid_start_time = time()
                 valid_score, valid_result = self._valid_epoch(valid_data, show_progress=show_progress)
+                #早停判断
                 self.best_valid_score, self.cur_step, stop_flag, update_flag = early_stopping(
                     valid_score,
                     self.best_valid_score,
@@ -364,6 +413,7 @@ class Trainer(object):
                     max_step=self.stopping_step,
                     bigger=self.valid_metric_bigger
                 )
+
                 valid_end_time = time()
                 valid_score_output = (set_color("epoch %d evaluating", 'green') + " [" + set_color("time", 'blue')
                                       + ": %.2fs, " + set_color("valid_score", 'blue') + ": %f]") % \
@@ -397,12 +447,20 @@ class Trainer(object):
 
         return self.best_valid_score, self.best_valid_result
 
+
+    '''
+    user：用户标识
+    time_seq：时间序列（可能用于时序建模）
+    history_index：用户历史交互过的物品索引（用于排除已交互物品）
+    positive_u / positive_i：正样本用户和物品（用于评估）
+    '''
     @torch.no_grad()
     def _full_sort_batch_eval(self, batched_data):
         user, time_seq, history_index, positive_u, positive_i = batched_data
         interaction = self.to_device(user)
         time_seq = self.to_device(time_seq)
         if self.config['model'] == 'HLLM':
+            #HLLM 且处于第 3 阶段（部署阶段），使用 self.model.module.predict 进行推理
             if self.config['stage'] == 3:
                 scores = self.model.module.predict(interaction, time_seq, self.item_feature)
             else:
@@ -412,9 +470,14 @@ class Trainer(object):
         scores = scores.view(-1, self.tot_item_num)
         scores[:, 0] = -np.inf
         if history_index is not None:
+            #将历史交互过的物品的分数也设为负无穷（避免推荐已经交互过的物品）
             scores[history_index] = -np.inf
         return scores, positive_u, positive_i
 
+    '''
+    实现的是物品特征预计算（compute_item_feature）功能
+    利用HLLM中的Item LLM将物品文本描述转换为固定维度的嵌入向量
+    '''
     @torch.no_grad()
     def compute_item_feature(self, config, data):
         if self.use_text:
@@ -424,11 +487,13 @@ class Trainer(object):
             self.logger.info(f"Inference item_data with {item_batch_size = } {len(item_loader) = }")
             self.item_feature = []
             with torch.no_grad():
+                #enumerate(item_loader) 为每个批次添加索引 返回 (index, batch_data) 元组
                 for idx, items in tqdm(enumerate(item_loader), total=len(item_loader)):
                     items = self.to_device(items)
-                    # self.logger.info(f"Inference item: {items = }")
                     items = self.model(items, mode='compute_item')
                     self.item_feature.append(items)
+                # 处理单输出或多输出情况
+                # 物品可能有多种特征：图像特征 + 文本特征  这里是尝试将特征划分开了
                 if isinstance(items, tuple):
                     self.item_feature = torch.cat([x[0] for x in self.item_feature]), torch.cat([x[1] for x in self.item_feature])
                 else:
@@ -439,34 +504,7 @@ class Trainer(object):
             with torch.no_grad():
                 self.item_feature = self.model.module.compute_item_all()
 
-        # Save item_feature to disk
-        if True:
-            save_path = "/root/autodl-pvt/HLLM/outputs/item_feature.pt"
-
-            to_save = self.item_feature
-            if isinstance(to_save, tuple):
-                to_save_cpu = tuple(x.detach().cpu() for x in to_save)
-                shapes = [tuple(x.shape) for x in to_save_cpu]
-                dtypes = [str(x.dtype) for x in to_save_cpu]
-            else:
-                to_save_cpu = to_save.detach().cpu()
-                shapes = tuple(to_save_cpu.shape)
-                dtypes = str(to_save_cpu.dtype)
-
-            torch.save(
-                {
-                    'item_feature': to_save_cpu,
-                    'meta': {
-                        'shapes': shapes,
-                        'dtypes': dtypes,
-                        'stage': self.config.get('stage'),
-                        'dataset': self.config.get('dataset'),
-                    }
-                },
-                save_path
-            )
-            self.logger.info(f"Saved item_feature to {save_path} shapes={shapes}")
-
+    #将多个GPU/进程上的张量收集起来，计算全局平均值。
     def distributed_concat(self, tensor, num_total_examples):
         output_tensors = [tensor.clone() for _ in range(torch.distributed.get_world_size())]
         torch.distributed.all_gather(output_tensors, tensor)
@@ -494,6 +532,7 @@ class Trainer(object):
                 self.lite.launch()
                 self.model = self.lite.setup(self.model)
 
+        #加载训练好的最佳模型参数
         if load_best_model:
             checkpoint_file = model_file or self.saved_model_file
             state = {"model": self.model}
@@ -516,6 +555,8 @@ class Trainer(object):
                     file=sys.stdout
                 ) if show_progress and self.rank == 0 else eval_data
             )
+
+            # 批量推理
             fwd_time = t.time()
             for batch_idx, batched_data in enumerate(iter_data):
                 start_time = fwd_time

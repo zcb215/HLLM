@@ -40,6 +40,7 @@ class HLLM(BaseModel):
         self.item_pretrain_dir = config['item_pretrain_dir']
         self.user_pretrain_dir = config['user_pretrain_dir']
         self.gradient_checkpointing = config['gradient_checkpointing']
+        print(f"self.gradient_checkpointing:{self.gradient_checkpointing}")
         self.use_ft_flash_attn = config['use_ft_flash_attn']
 
         # 依据论文里面的架构，设计物品模型和用户模型
@@ -47,7 +48,7 @@ class HLLM(BaseModel):
         self.item_llm = self.create_llm(self.item_pretrain_dir, config['item_llm_init'])
         self.logger.info(f"create user llm")
         self.user_llm = self.create_llm(self.user_pretrain_dir, config['user_llm_init'])
-
+        # input()    # 545 M
         # 可学习的物品嵌入token
         self.item_emb_token_n = config['item_emb_token_n']
         if self.item_emb_token_n > 1:
@@ -87,7 +88,36 @@ class HLLM(BaseModel):
 
         # 从预训练目录加载模型配置  
         hf_config = AutoConfig.from_pretrained(pretrain_dir, trust_remote_code=True)
-        # todo   可以输出一下 hf config的配置信息
+        # 可以输出一下 hf config的配置信息
+        # LlamaConfig {
+        # "_name_or_path": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        # "architectures": [
+        #     "LlamaForCausalLM"
+        # ],
+        # "attention_bias": false,
+        # "attention_dropout": 0.0,
+        # "bos_token_id": 1,
+        # "eos_token_id": 2,
+        # "hidden_act": "silu",
+        # "hidden_size": 2048,
+        # "initializer_range": 0.02,
+        # "intermediate_size": 5632,
+        # "max_position_embeddings": 2048,
+        # "mlp_bias": false,
+        # "model_type": "llama",
+        # "num_attention_heads": 32,
+        # "num_hidden_layers": 22,
+        # "num_key_value_heads": 4,
+        # "pretraining_tp": 1,
+        # "rms_norm_eps": 1e-05,
+        # "rope_scaling": null,
+        # "rope_theta": 10000.0,
+        # "tie_word_embeddings": false,
+        # "torch_dtype": "bfloat16",
+        # "transformers_version": "4.41.1",
+        # "use_cache": true,
+        # "vocab_size": 32000
+        # }
         self.logger.info(f"hf_config: {hf_config}")
         hf_config.gradient_checkpointing = self.gradient_checkpointing  # 梯度检查点节省显存
         hf_config.use_cache = False           # 禁用KV缓存，节省推理内存
