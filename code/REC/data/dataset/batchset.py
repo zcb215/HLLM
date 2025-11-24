@@ -68,8 +68,7 @@ class BatchTextDataset(Dataset):
             
             ids = out["input_ids"]
 
-            #self.logger.info(f"Process item: {ids.shape = }, origin_ids={ids_origin.shape}")
-            self.logger.info(f"Process item: ids_len={len(ids)}, origin_ids_len={len(ids_origin)}")
+            self.logger.info(f"Process item: {ids.shape = }, origin_ids={ids_origin.shape}")
 
             mask = [1] * len(ids)
 

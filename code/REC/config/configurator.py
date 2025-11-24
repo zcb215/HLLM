@@ -20,6 +20,8 @@ class Config(object):
         self._init_parameters_category()
         self.yaml_loader = self._build_yaml_loader()
         self.final_config_dict = self._load_config_files(config_file_list)
+        # print(f"final_config_dict:{self.final_config_dict}")
+        # input()
         self.model_class = get_model(self.model)
         self._set_default_parameters()
 
@@ -128,6 +130,7 @@ class Config(object):
             raise TypeError(f'The topk [{topk}] must be a integer, list')
 
     def __setitem__(self, key, value):
+        # print(f"set key: {key}  value: {value}")
         if not isinstance(key, str):
             raise TypeError("index must be a str.")
         self.final_config_dict[key] = value

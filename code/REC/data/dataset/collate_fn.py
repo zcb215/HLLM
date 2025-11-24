@@ -43,7 +43,7 @@ def customize_collate(batch):
             out = elem.new(storage)
             print( "customize_collate numel:", numel )
         # return torch.stack(batch, 0, out=out)
-        return torch.stack(batch, 0)
+        return torch.stack(batch, 0, out=out)
     elif (
         elem_type.__module__ == "numpy"
         and elem_type.__name__ != "str_"

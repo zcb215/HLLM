@@ -45,14 +45,13 @@ def convert_str(s):
 def run_loop(local_rank, config_file=None, saved=True, extra_args=[]):
 
     # configurations initialization
+    # print(f"config_file :{config_file}")
+    # input()
     config = Config(config_file_list=config_file)
-    print(f"config {config}")
-    input()
-
+    # print(f"config:{config}")
+    
     device = torch.device("cuda", local_rank)
     config['device'] = device
-
-    # 加载运行的时候的 配置信息，比如使用什么模型什么的
     if len(extra_args):
         for i in range(0, len(extra_args), 2):
             key = extra_args[i][2:]
@@ -76,13 +75,68 @@ def run_loop(local_rank, config_file=None, saved=True, extra_args=[]):
                 raise ValueError(f"{key} {value} invalid")
 
     init_seed(config['seed'], config['reproducibility'])
-
+    # input()
     # logger initialization
     init_logger(config)
     logger = getLogger()
     if 'text_path' in config:
         config['text_path'] = os.path.join(config['text_path'], config['dataset'] + '.csv')
         logger.info(f"Update text_path to {config['text_path']}")
+
+    #print(f" config information:{config}")
+    '''
+    config information:
+    General Hyper Parameters:
+    seed = 2020
+    state = INFO
+    use_text = True
+    reproducibility = True
+    checkpoint_dir = /root/autodl-pvt/HLLM/checkpoints
+    show_progress = True
+    log_wandb = False
+    data_path = ../dataset/
+    strategy = deepspeed
+    precision = bf16-mixed
+    model = HLLM
+
+    Training Hyper Parameters:
+    epochs = 5
+    train_batch_size = 2
+    optim_args = {'learning_rate': 0.0001, 'weight_decay': 0.01}
+    eval_step = 1
+    stopping_step = 5
+
+    Evaluation Hyper Parameters:
+    eval_batch_size = 256
+    topk = [5, 10, 50, 200]
+    metrics = ['Recall', 'NDCG']
+    valid_metric = NDCG@200
+    metric_decimal_place = 7
+    eval_type = EvaluatorType.RANKING
+    valid_metric_bigger = True
+
+    Dataset Hyper Parameters:
+    MAX_ITEM_LIST_LENGTH = 10
+    MAX_TEXT_LENGTH = 256
+    text_keys = ['title', 'description']
+    item_prompt = Compress the following sentence into embedding: 
+
+    Other Hyper Parameters: 
+    wandb_project = REC
+    text_path = /root/autodl-pvt/HLLM/information/amazon_books.csv
+    item_emb_token_n = 1
+    loss = nce
+    scheduler_args = {'type': 'cosine', 'warmup': 0.1}
+    stage = 2
+    item_pretrain_dir = TinyLlama/TinyLlama-1.1B-Chat-v1.0
+    item_llm_init = True
+    user_pretrain_dir = TinyLlama/TinyLlama-1.1B-Chat-v1.0
+    user_llm_init = True
+    use_ft_flash_attn = True
+    MODEL_INPUT_TYPE = InputType.SEQ
+    device = cuda:0
+    val_only = True
+    '''
 
     # get model and data
     dataload = load_data(config)
@@ -136,6 +190,13 @@ if __name__ == '__main__':
     args, extra_args = parser.parse_known_args()
     local_rank = int(os.environ['LOCAL_RANK'])
     config_file = args.config_file
+
+    '''
+    1. PARSED ARGUMENTS:
+   - config_file: ['overall/LLM_deepspeed.yaml', 'HLLM/HLLM.yaml']
+   - extra_args: ['--loss', 'nce', '--epochs', '5', '--dataset', 'amazon_books', '--train_batch_size', '2', '--MAX_TEXT_LENGTH', '256', '--MAX_ITEM_LIST_LENGTH', '10', '--checkpoint_dir', '/root/autodl-pvt/HLLM/checkpoints', '--optim_args.learning_rate', '1e-4', '--item_pretrain_dir', 'TinyLlama/TinyLlama-1.1B-Chat-v1.0', '--user_pretrain_dir', 'TinyLlama/TinyLlama-1.1B-Chat-v1.0', '--text_path', '/root/autodl-pvt/HLLM/information', '--text_keys', '["title","description"]', '--val_only', 'True']
+   - local_rank: 0
+    '''
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(backend='nccl')

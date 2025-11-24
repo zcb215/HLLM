@@ -27,10 +27,17 @@ from torch_geometric.utils import degree
 class Data:
     def __init__(self, config):
         self.config = config
+        # print(f"Data config:{config}")
+        # input()
         self.dataset_path = config['data_path']
         self.dataset_name = config['dataset']
+        # print(f"config['dataset']:{config['dataset']}")
+        # input()
         self.data_split = config['data_split']
+        # print(f"config['data_split']:{config['data_split']}")   # non
         self.item_data = config['item_data']
+        # print(f"config['item_data']:{config['item_data']}")   #non
+        # input()
         self.logger = getLogger()
         self._from_scratch()
 
@@ -60,8 +67,8 @@ class Data:
 
     def _data_processing(self):
 
-        self.id2token = {}
-        self.token2id = {}
+        self.id2token = {}  # 索引 -> 原始ID
+        self.token2id = {}  # 原始ID -> 索引
         remap_list = ['user_id', 'item_id']
         for feature in remap_list:
             if feature == 'item_id' and self.item_data:
@@ -69,8 +76,20 @@ class Data:
                 feats_raw = self.inter_feat[feature]
             else:
                 feats = self.inter_feat[feature]
+            # print(f"self.inter_feat:\n {self.inter_feat}")
+            # print(f"feats:\n {feats}")
+            # input()
+            # 相当于离散化，讲原先的id转化为数字信息，同时map则是记录原始数据的，可以使用前面的 idlist和mp还原回原始的数据信息
+            # mp: 唯一值数组，即原始数据中去重后的值， new_ids_list  则是全数据的 id 表示
             new_ids_list, mp = pd.factorize(feats)
+            # print(f"new_ids_list:\n {new_ids_list}")
+            # print(f"mp:\n {mp}")
+            # input()
+            # 2. 添加 [PAD] 标记
             mp = ['[PAD]'] + list(mp)
+            # mp: ['[PAD]', 'user3', 'user1', 'user2']
+            # print(f"mp:\n {mp}")
+            # input()
             token_id = {t: i for i, t in enumerate(mp)}
             if feature == 'item_id' and self.item_data:
                 _, raw_mp = pd.factorize(feats_raw)
@@ -82,6 +101,7 @@ class Data:
 
             self.id2token[feature] = mp
             self.token2id[feature] = token_id
+            #应用 id 
             self.inter_feat[feature] = self.inter_feat[feature].map(token_id)
 
         self.user_num = len(self.id2token['user_id'])
@@ -98,6 +118,20 @@ class Data:
     def build(self):
         self.logger.info(f"build {self.dataset_name} dataload")
         self.sort(by='timestamp')
+        # print(self.inter_feat.head(80))
+        # input()
+        #         item_id  user_id  timestamp
+        # 5911050   165053   409678  832550400
+        # 186647     51599    13186  835660800
+        # 186648     24310    13186  840240000
+        # 186649      9828    13186  843004800
+        # 8733632   578448   604234  848016000
+        # ...          ...      ...        ...
+        # 487945    144107    33356  866505600
+        # 5332502    39863   368729  866505600
+        # 487944    207202    33356  866505600
+        # 487943    208405    33356  866505600
+        # 186654      4135    13186  866592000
         user_list = self.inter_feat['user_id'].values
         item_list = self.inter_feat['item_id'].values
         timestamp_list = self.inter_feat['timestamp'].values
@@ -109,25 +143,37 @@ class Data:
             user_seq[uid] = item_list[index]
             time_seq[uid] = timestamp_list[index]
 
+        # 依据用户的进行分组，得到基于用户的交互记录，依次是交互的物品和交互时间
         self.user_seq = user_seq
         self.time_seq = time_seq
         train_feat = dict()
         indices = []
 
+        # 对于训练数据进行调整，删除最后两列
         for index in grouped_index.values():
             indices.extend(list(index)[:-2])
-
-        # 这里获取的train_feat数据是一句 indices的数据得到的，前面是排序的数据，这里又是分类的插入，所以最终的数据是即分类又排序的
+        
+        # print(f"indices :{indices[:20]}")
+        # input()
+        # 这里 的 train_feat 数据会按照indices 的顺序写入  而indices  又是按照用户分类的
+        # 所有 train_feat 最终的效果是 先按照用户分类 在按照 时间排序
+            
+        # item_id
+        # user_id
+        # timestamp
         for k in self.inter_feat:
+            # print(k)
             train_feat[k] = self.inter_feat[k].values[indices]
-
+        # input()
         if self.config['MODEL_INPUT_TYPE'] == InputType.AUGSEQ:
             train_feat = self._build_aug_seq(train_feat)
         elif self.config['MODEL_INPUT_TYPE'] == InputType.SEQ:
             train_feat = self._build_seq(train_feat)
-
+        # print(f"seq_train_feat:{train_feat}")
+        # input()
         self.train_feat = train_feat
 
+    #用于分组操作，以便可以根据键快速找到所有出现的位置。
     def _grouped_index(self, group_by_list):
         index = {}
         for i, key in enumerate(group_by_list):
@@ -152,11 +198,13 @@ class Data:
             if save:
                 if (self.data_split is None or self.data_split == True) and i - seq_start > max_item_list_len:
                     offset = (i - seq_start) % max_item_list_len
+                    # 去除太古早的历史部分
                     seq_start += offset
                     x = torch.arange(seq_start, i)
                     sx = torch.split(x, max_item_list_len)
                     for sub in sx:
                         uid_list.append(last_uid)
+                        # 这里存入的是物品的索引
                         item_list_index.append(slice(sub[0], sub[-1]+1))
                 else:
                     uid_list.append(last_uid)
@@ -170,6 +218,7 @@ class Data:
         seq_train_feat['user_id'] = np.array(uid_list)
         seq_train_feat['item_seq'] = []
         seq_train_feat['time_seq'] = []
+        # 从 物品集 的下标 转为具体的数据     这里的是砍掉了最后两个的数据
         for index in item_list_index:
             seq_train_feat['item_seq'].append(train_feat['item_id'][index])
             seq_train_feat['time_seq'].append(train_feat['timestamp'][index])
@@ -217,8 +266,13 @@ class Data:
         aug_uid_list = []
         aug_item_list = []
         for uid, item_index in zip(uid_list, item_list_index):
+            # 获取的是切片的 start 和 end
             st = item_index.start
             ed = item_index.stop
+            # 增强 序列  比如长度为2的序列 最终产生的输出如下
+            # 用户B-子序列1:
+            # - [item7]                          # 长度1
+            # - [item7, item8]                   # 长度2
             lens = ed - st
             for sub_idx in range(1, lens):
                 aug_item_list.append(train_feat['item_id'][slice(st, st+sub_idx+1)])
@@ -255,6 +309,7 @@ class Data:
 
     @property
     def avg_actions_of_users(self):
+        # 计算每个用户平均有多少条交互记录
         """Get the average number of users' interaction records.
 
         Returns:

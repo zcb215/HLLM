@@ -29,6 +29,7 @@ class SEQTrainDataset(Dataset):
         self.config = config
 
         self.item_num = dataload.item_num
+        # 记住这里的数据集已经从字典转为列表 了 纯物品数据
         self.train_seq = dataload.train_feat['item_seq']
 
         self.length = len(self.train_seq)
@@ -45,12 +46,14 @@ class SEQTrainDataset(Dataset):
         return self.length
 
     def _neg_sample(self, item_set):
+        # 疯狂的循环找到 不在 已选队列里面的
         item = random.randint(1, self.item_num - 1)
         while item in item_set:
             item = random.randint(1, self.item_num - 1)
         return item
 
     def _padding_sequence(self, sequence, max_length, random_sample=False):
+        # 对序列进行填充
         pad_len = max_length - len(sequence)
         if random_sample:
             pad_seq = [self._neg_sample(sequence) for _ in range(pad_len)]
@@ -64,6 +67,7 @@ class SEQTrainDataset(Dataset):
         masked_index = []
         neg_item = []
         item_seq_len = len(item_seq)
+        # 不遍历到 item_seq_len  是因为训练的时候需要有正样本 ，数据只有这么多
         for i in range(item_seq_len - 1):
             neg_item.append(self._neg_sample(item_seq))
             masked_index.append(1)
@@ -181,11 +185,13 @@ class TextSEQTrainDataset(Dataset):
         item_seq, neg_item, masked_index = self.reconstruct_train_data(item_seq)
         time_seq = self.train_time_seq[index]
         time_seq = self._padding_time_sequence(list(time_seq), self.max_seq_length)
+        # 物品ID转换为token
         item_seq_token = self.id2token[item_seq]
         neg_items_token = self.id2token[neg_item]
         pos_input_ids, pos_cu_input_lens, pos_position_ids = [], [], []
         neg_input_ids, neg_cu_input_lens, neg_position_ids = [], [], []
 
+        # 文本特征处理函数
         def process_item(item):
             if item != self.id2token[0] and item not in self.env:
                 # assert item in self.env, f"{item}"
@@ -201,13 +207,14 @@ class TextSEQTrainDataset(Dataset):
 
             ids = self.tokenizer.encode(text_str)
             ids = ids[:self.max_text_length]
-            mask = [1] * len(ids)
+            mask = [1] * len(ids) # 创建掩码
             return ids, mask
 
         for item in item_seq_token:
             ids, _ = process_item(item)
             pos_input_ids.extend(ids + [0] * self.item_emb_token_n)
             pos_cu_input_lens.append(len(ids) + self.item_emb_token_n)
+            # 生成位置ID
             pos_position_ids.extend((torch.arange(len(ids) + self.item_emb_token_n) + (self.max_text_length - len(ids))).tolist())
 
         for neg in neg_items_token:
@@ -217,15 +224,15 @@ class TextSEQTrainDataset(Dataset):
             neg_position_ids.extend((torch.arange(len(ids) + self.item_emb_token_n) + (self.max_text_length - len(ids))).tolist())
 
         outputs = {
-            "pos_item_ids": torch.as_tensor(item_seq, dtype=torch.int64),
-            "neg_item_ids": torch.as_tensor(neg_item, dtype=torch.int64),
-            "pos_input_ids": torch.as_tensor(pos_input_ids, dtype=torch.int64),
-            "pos_cu_input_lens": torch.as_tensor(pos_cu_input_lens, dtype=torch.int64),
-            "pos_position_ids": torch.as_tensor(pos_position_ids, dtype=torch.int64),
-            "neg_input_ids": torch.as_tensor(neg_input_ids, dtype=torch.int64),
-            "neg_cu_input_lens": torch.as_tensor(neg_cu_input_lens, dtype=torch.int64),
-            "neg_position_ids": torch.as_tensor(neg_position_ids, dtype=torch.int64),
-            "attention_mask": torch.as_tensor(masked_index, dtype=torch.int64),
-            "time_ids": torch.as_tensor(time_seq, dtype=torch.int64),
+            "pos_item_ids": torch.as_tensor(item_seq, dtype=torch.int64),  # 正样本物品ID
+            "neg_item_ids": torch.as_tensor(neg_item, dtype=torch.int64),  # 负样本物品ID
+            "pos_input_ids": torch.as_tensor(pos_input_ids, dtype=torch.int64),  # 正样本文本ID
+            "pos_cu_input_lens": torch.as_tensor(pos_cu_input_lens, dtype=torch.int64),  # 正样本累积长度
+            "pos_position_ids": torch.as_tensor(pos_position_ids, dtype=torch.int64),  # 正样本位置ID
+            "neg_input_ids": torch.as_tensor(neg_input_ids, dtype=torch.int64),  # 负样本文本ID
+            "neg_cu_input_lens": torch.as_tensor(neg_cu_input_lens, dtype=torch.int64),  # 负样本累积长度
+            "neg_position_ids": torch.as_tensor(neg_position_ids, dtype=torch.int64),  # 负样本位置ID
+            "attention_mask": torch.as_tensor(masked_index, dtype=torch.int64),  # 注意力掩码
+            "time_ids": torch.as_tensor(time_seq, dtype=torch.int64),  # 时间特征
         }
         return outputs

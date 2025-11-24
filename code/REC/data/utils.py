@@ -46,7 +46,9 @@ def bulid_dataloader(config, dataload):
 
     dataset_module = importlib.import_module('REC.data.dataset')
     train_set_name, test_set_name, collate_fn_name = dataset_dict[model_name]
-
+    # print(train_set_name)
+    # input()
+    # 处理训练集的特殊配置（如HLLM）
     if isinstance(train_set_name, tuple):
         train_set_class = getattr(dataset_module, train_set_name[0])
         train_collate_fn = getattr(dataset_module, train_set_name[1])
@@ -54,9 +56,14 @@ def bulid_dataloader(config, dataload):
         train_set_class = getattr(dataset_module, train_set_name)
         train_collate_fn = None
 
+    # print(f"train_set_class:{train_set_class}")
+    # print(f"train_collate_fn:{train_collate_fn}")
     test_set_class = getattr(dataset_module, test_set_name)
+    # print(f"test_set_class:{test_set_class}")
     eval_collate_fn = getattr(dataset_module, collate_fn_name)
+    # print(f"eval_collate_fn:{eval_collate_fn}")
 
+    # input()
     train_data = train_set_class(config, dataload)
     valid_data = test_set_class(config, dataload, phase='valid')
     test_data = test_set_class(config, dataload, phase='test')
