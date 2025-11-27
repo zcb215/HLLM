@@ -23,7 +23,7 @@ import numpy as np
 import argparse
 import torch.distributed as dist
 import torch
-
+from REC.utils import print_gpu_memory
 
 def convert_str(s):
     try:
@@ -154,20 +154,33 @@ def run_loop(local_rank, config_file=None, saved=True, extra_args=[]):
     logger.info(dataload)
     logger.info('model structure:')
     logger.info(model)
+    print("rec/run.py")
+    print("waiting for input")
+    print_gpu_memory()
     # input()   # 到这里显存使用都不大
 
     # 典型的机器学习模型训练和评估流程
     if config['val_only']:
         # 只进行模型评估，不训练
+        # 1. 加载预训练模型
         ckpt_path = os.path.join(config['checkpoint_dir'], 'pytorch_model.bin')
         ckpt = torch.load(ckpt_path, map_location='cpu')
         logger.info(f'Eval only model load from {ckpt_path}')
+        # 2. 加载模型权重
         msg = trainer.model.load_state_dict(ckpt, False)
         logger.info(f'{msg.unexpected_keys = }')
         logger.info(f'{msg.missing_keys = }')
-        test_result = trainer.evaluate(test_loader, load_best_model=False, show_progress=config['show_progress'], init_model=True)
+        # 3. 在测试集上评估
+        test_result = trainer.evaluate(
+            test_loader, 
+            load_best_model=False,    # 不加载最佳模型（因为已经手动加载）
+            show_progress=config['show_progress'],
+            init_model=True           # 初始化模型状态
+        )
         logger.info(set_color('test result', 'yellow') + f': {test_result}')
     else:
+        # 完整训练模式 
+        logger.info('start training')
         # training process
         best_valid_score, best_valid_result = trainer.fit(
             train_loader, valid_loader, saved=saved, show_progress=config['show_progress']

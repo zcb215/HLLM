@@ -14,10 +14,10 @@ python3 main.py \
     --train_batch_size 2 \
     --MAX_TEXT_LENGTH 256 \
     --MAX_ITEM_LIST_LENGTH 10 \
-    --checkpoint_dir /root/autodl-pvt/HLLM/checkpoints \
+    --checkpoint_dir /root/autodl-tmp/HLLM/checkpoints \
     --optim_args.learning_rate 1e-4 \
     --item_pretrain_dir "$MODEL_DIR" \
     --user_pretrain_dir "$MODEL_DIR" \
-    --text_path /root/autodl-pvt/HLLM/information \
+    --text_path /root/autodl-tmp/HLLM/information \
     --text_keys '[\"title\",\"description\"]' \
-    --val_only True
+    --val_only false

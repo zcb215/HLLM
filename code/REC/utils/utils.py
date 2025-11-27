@@ -23,6 +23,24 @@ def get_local_time():
 
     return cur
 
+def print_gpu_memory():
+    if torch.cuda.is_available():
+        gpu_id = torch.cuda.current_device()
+        gpu_name = torch.cuda.get_device_name(gpu_id)
+        
+        # PyTorch显存
+        allocated = torch.cuda.memory_allocated(gpu_id)
+        reserved = torch.cuda.memory_reserved(gpu_id)
+        
+        # GPU总显存
+        total_memory = torch.cuda.get_device_properties(gpu_id).total_memory
+        
+        print(f"GPU {gpu_id} ({gpu_name}):")
+        print(f"  总显存: {total_memory/1024**3:.2f} GB")
+        print(f"  PyTorch使用: {allocated/1024**3:.2f} GB ({allocated/total_memory*100:.1f}%)")
+        print(f"  实际剩余: {(total_memory - allocated)/1024**3:.2f} GB ({(total_memory - allocated)/total_memory*100:.1f}%)")
+    else:
+        print("CUDA不可用")
 
 def ensure_dir(dir_path):
     r"""Make sure the directory exists, if it does not exist, create it

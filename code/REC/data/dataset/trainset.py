@@ -39,6 +39,7 @@ class SEQTrainDataset(Dataset):
         self.random_sample = True if config['loss'] and config['loss'] == 'nce' else False
         self.num_negatives = config['num_negatives']
         if self.num_negatives:
+            # 这就是全局 Batch Size（Global Batch Size），即一次训练迭代中所有 GPU 处理的样本总和  get_world_size 是 GPU 的数量
             self.num_negatives = math.ceil(self.num_negatives / dist.get_world_size() / config['train_batch_size'])
         logger.info(f"Use random sample {self.random_sample} for mask id")
 

@@ -19,6 +19,7 @@ import torch.optim as optim
 import torch.distributed as dist
 from tqdm import tqdm
 import deepspeed
+import gc
 
 from ..data.dataset import BatchTextDataset
 from ..data.dataset.collate_fn import customize_rmpad_collate
@@ -373,6 +374,31 @@ class Trainer(object):
         self.lite.launch()
         self.model, self.optimizer = self.lite.setup(self.model, self.optimizer)
 
+        self.logger.info(f"finish load model")
+        base_mem = torch.cuda.memory_allocated() / 1024**2
+        print(f"fit Loop Start Mem: {base_mem:.2f} MB")   #fit Loop Start Mem: 12611.09 MB
+        input()
+
+        # Wed Nov 26 13:31:18 2025       
+        # +-----------------------------------------------------------------------------------------+
+        # | NVIDIA-SMI 570.172.08             Driver Version: 570.172.08     CUDA Version: 12.8     |
+        # |-----------------------------------------+------------------------+----------------------+
+        # | GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+        # | Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+        # |                                         |                        |               MIG M. |
+        # |=========================================+========================+======================|
+        # |   0  NVIDIA GeForce RTX 4090        Off |   00000000:84:00.0 Off |                  Off |
+        # | 46%   28C    P8             31W /  450W |   21701MiB /  24564MiB |      0%      Default |
+        # |                                         |                        |                  N/A |
+        # +-----------------------------------------+------------------------+----------------------+
+                                                                                                
+        # +-----------------------------------------------------------------------------------------+
+        # | Processes:                                                                              |
+        # |  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
+        # |        ID   ID                                                               Usage      |
+        # |=========================================================================================|
+        # +-----------------------------------------------------------------------------------------+
+
         #自动恢复机制
         if self.config['auto_resume']:
             raise NotImplementedError
@@ -383,13 +409,16 @@ class Trainer(object):
         for epoch_idx in range(self.start_epoch, self.epochs):
             # train
             if self.config['need_training'] == None or self.config['need_training']:
+                # 每个 epoch 中数据的随机洗牌（Shuffle）方式不同
                 train_data.sampler.set_epoch(epoch_idx)
+
                 training_start_time = time()
                 train_loss = self._train_epoch(train_data, epoch_idx, show_progress=show_progress)
                 self.train_loss_dict[epoch_idx] = sum(train_loss) if isinstance(train_loss, tuple) else train_loss
                 training_end_time = time()
                 train_loss_output = \
                     self._generate_train_loss_output(epoch_idx, training_start_time, training_end_time, train_loss)
+                
                 if verbose:
                     self.logger.info(train_loss_output)
                 if self.rank == 0:
@@ -449,24 +478,45 @@ class Trainer(object):
 
 
     '''
-    user：用户标识
-    time_seq：时间序列（可能用于时序建模）
-    history_index：用户历史交互过的物品索引（用于排除已交互物品）
-    positive_u / positive_i：正样本用户和物品（用于评估）
+    user:用户标识
+    time_seq::时间序列(可能用于时序建模)
+    history_index:用户历史交互过的物品索引（用于排除已交互物品）
+    positive_u / positive_i:正样本用户和物品（用于评估）
     '''
     @torch.no_grad()
     def _full_sort_batch_eval(self, batched_data):
         user, time_seq, history_index, positive_u, positive_i = batched_data
         interaction = self.to_device(user)
         time_seq = self.to_device(time_seq)
-        if self.config['model'] == 'HLLM':
-            #HLLM 且处于第 3 阶段（部署阶段），使用 self.model.module.predict 进行推理
-            if self.config['stage'] == 3:
-                scores = self.model.module.predict(interaction, time_seq, self.item_feature)
-            else:
-                scores = self.model((interaction, time_seq, self.item_feature), mode='predict')
+
+        # 【修改点 1】：处理 item_feature 的设备问题
+        # 此时 self.item_feature 存储在 CPU 上，但模型在 GPU 上。
+        # 我们需要在推理前将其移动到 GPU。
+        # 注意：如果显存非常紧张，移动整个大张量可能会再次 OOM，但在拼接阶段已经省下了大量显存，通常这里能放下。
+        if isinstance(self.item_feature, tuple):
+            # 如果是元组（如图像+文本特征），分别移动到 GPU
+            batch_item_feature = tuple(x.to(self.device) for x in self.item_feature)
         else:
-            scores = self.model.module.predict(interaction, time_seq, self.item_feature)
+            # 如果是单个张量，直接移动到 GPU
+            batch_item_feature = self.item_feature.to(self.device)
+
+        if self.config['model'] == 'HLLM':
+            # HLLM 且处于第 3 阶段（部署阶段），使用 self.model.module.predict 进行推理
+            if self.config['stage'] == 3:
+                scores = self.model.module.predict(interaction, time_seq, batch_item_feature)
+            else:
+                scores = self.model((interaction, time_seq, batch_item_feature), mode='predict')
+        else:
+            scores = self.model.module.predict(interaction, time_seq, batch_item_feature)
+
+        # if self.config['model'] == 'HLLM':
+        #     #HLLM 且处于第 3 阶段（部署阶段），使用 self.model.module.predict 进行推理
+        #     if self.config['stage'] == 3:
+        #         scores = self.model.module.predict(interaction, time_seq, self.item_feature)
+        #     else:
+        #         scores = self.model((interaction, time_seq, self.item_feature), mode='predict')
+        # else:
+        #     scores = self.model.module.predict(interaction, time_seq, self.item_feature)
         scores = scores.view(-1, self.tot_item_num)
         scores[:, 0] = -np.inf
         if history_index is not None:
@@ -475,7 +525,7 @@ class Trainer(object):
         return scores, positive_u, positive_i
 
     '''
-    实现的是物品特征预计算（compute_item_feature）功能
+    实现的是物品特征预计算(compute_item_feature)功能
     利用HLLM中的Item LLM将物品文本描述转换为固定维度的嵌入向量
     '''
     @torch.no_grad()
@@ -491,15 +541,41 @@ class Trainer(object):
                 for idx, items in tqdm(enumerate(item_loader), total=len(item_loader)):
                     items = self.to_device(items)
                     items = self.model(items, mode='compute_item')
+
+                    # 【修改点 2】：计算完成后立即移回 CPU
+                    # 目的：避免 GPU 显存中积累大量计算图或张量，释放显存给后续批次
+                    if isinstance(items, tuple):
+                        items = tuple(x.cpu() for x in items)
+                    else:
+                        items = items.cpu()
+
                     self.item_feature.append(items)
                 # 处理单输出或多输出情况
                 # 物品可能有多种特征：图像特征 + 文本特征  这里是尝试将特征划分开了
-                if isinstance(items, tuple):
-                    self.item_feature = torch.cat([x[0] for x in self.item_feature]), torch.cat([x[1] for x in self.item_feature])
+                # if isinstance(items, tuple):
+                #     self.item_feature = torch.cat([x[0] for x in self.item_feature]), torch.cat([x[1] for x in self.item_feature])
+                # else:
+                #     self.item_feature = torch.cat(self.item_feature)
+                # if self.config['stage'] == 3:
+                #     self.item_feature = self.item_feature.bfloat16()
+
+
+                # 【修改点 3】：拼接操作在 CPU 上进行
+                # 因为 list 中的元素已经是 CPU 张量了，torch.cat 会在 CPU 内存中分配空间，不占用显存
+                if isinstance(self.item_feature[0], tuple): # 检查第一个元素是否为 tuple
+                    # 假设结构是 [(feat1_batch1, feat2_batch1), (feat1_batch2, feat2_batch2), ...]
+                    # 我们需要将其转变为 (cat(feat1_all), cat(feat2_all))
+                    feat1 = torch.cat([x[0] for x in self.item_feature])
+                    feat2 = torch.cat([x[1] for x in self.item_feature])
+                    self.item_feature = (feat1, feat2)
                 else:
                     self.item_feature = torch.cat(self.item_feature)
+                # 类型转换也在 CPU 上完成
                 if self.config['stage'] == 3:
-                    self.item_feature = self.item_feature.bfloat16()
+                    if isinstance(self.item_feature, tuple):
+                        self.item_feature = tuple(x.bfloat16() for x in self.item_feature)
+                    else:
+                        self.item_feature = self.item_feature.bfloat16()
         else:
             with torch.no_grad():
                 self.item_feature = self.model.module.compute_item_all()
@@ -519,11 +595,19 @@ class Trainer(object):
             nnodes = world_size // local_world_size
             if self.config['strategy'] == 'deepspeed':
                 self.logger.info(f"Use deepspeed strategy")
+                # input()
+                # 精度设置  precision = bf16-mixed
                 precision = self.config['precision'] if self.config['precision'] else '32'
+                # stage = 2     DeepSpeed 的优化阶段
                 strategy = DeepSpeedStrategy(stage=self.config['stage'], precision=precision)
+                #  Fabric 初始化
                 self.lite = L.Fabric(accelerator='gpu', strategy=strategy, precision=precision, num_nodes=nnodes)
+                # 启动分布式环境
                 self.lite.launch()
                 self.model, self.optimizer = self.lite.setup(self.model, self.optimizer)
+                now_mem = torch.cuda.memory_allocated() / 1024**2
+                print(f"finish load mem: {now_mem:.2f} MB")
+                print("finished init model")
             else:
                 self.logger.info(f"Use DDP strategy")
                 precision = self.config['precision'] if self.config['precision'] else '32'
@@ -540,12 +624,17 @@ class Trainer(object):
             message_output = 'Loading model structure and parameters from {}'.format(checkpoint_file)
             self.logger.info(message_output)
 
-        with torch.no_grad():
+        print("start evalute")
+        with torch.no_grad():   
             self.model.eval()
+            print("into eval no grad")
+            # 评估函数的方法，这里采用的是全排序的   
             eval_func = self._full_sort_batch_eval
 
             self.tot_item_num = eval_data.dataset.dataload.item_num
+            # 卡在这一步的执行上面了   这里把物品的 embending存入显存了
             self.compute_item_feature(self.config, eval_data.dataset.dataload)
+            print("finish compute_item_feature")
             iter_data = (
                 tqdm(
                     eval_data,
@@ -558,15 +647,25 @@ class Trainer(object):
 
             # 批量推理
             fwd_time = t.time()
+            # # 【监控】循环开始前的显存
+            base_mem = torch.cuda.memory_allocated() / 1024**2
+            print(f"Loop Start Mem: {base_mem:.2f} MB")
             for batch_idx, batched_data in enumerate(iter_data):
+                # # 【监控 1】批次开始
+                # mem_1 = torch.cuda.memory_allocated() / 1024**2
                 start_time = fwd_time
                 data_time = t.time()
                 scores, positive_u, positive_i = eval_func(batched_data)
+                # 【监控 2】推理完成后 (如果这里激增，说明是 scores 张量太大)
+                # mem_2 = torch.cuda.memory_allocated() / 1024**2
                 fwd_time = t.time()
-
                 if show_progress and self.rank == 0:
                     iter_data.set_postfix_str(f"data: {data_time-start_time:.3f} fwd: {fwd_time-data_time:.3f}", refresh=False)
                 self.eval_collector.eval_batch_collect(scores, positive_u, positive_i)
+                # 【监控 3】收集完成后 (如果这里比 mem_1 持续增加，说明 collector 把 GPU 张量存起来了)
+                # mem_3 = torch.cuda.memory_allocated() / 1024**2
+                # 打印显存变化详情
+
             num_total_examples = len(eval_data.sampler.dataset)
             struct = self.eval_collector.get_data_struct()
             result = self.evaluator.evaluate(struct)

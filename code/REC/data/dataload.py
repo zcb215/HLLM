@@ -220,11 +220,13 @@ class Data:
         seq_train_feat['time_seq'] = []
         # 从 物品集 的下标 转为具体的数据     这里的是砍掉了最后两个的数据
         for index in item_list_index:
+            # train_feat['item_id'][index] 等同于 [101, 102, 103, 201...][0:3]
             seq_train_feat['item_seq'].append(train_feat['item_id'][index])
             seq_train_feat['time_seq'].append(train_feat['timestamp'][index])
 
         return seq_train_feat
 
+    # 自回归（Next Item Prediction）数据增强方式
     def _build_aug_seq(self, train_feat):
         max_item_list_len = self.config['MAX_ITEM_LIST_LENGTH']+1
 
