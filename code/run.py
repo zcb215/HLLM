@@ -23,7 +23,6 @@ import numpy as np
 import argparse
 import torch.distributed as dist
 import torch
-from REC.utils import print_gpu_memory
 
 def convert_str(s):
     try:
@@ -52,13 +51,32 @@ def run_loop(local_rank, config_file=None, saved=True, extra_args=[]):
     
     device = torch.device("cuda", local_rank)
     config['device'] = device
+
+    print(f" extra_args:{extra_args}")
     if len(extra_args):
         for i in range(0, len(extra_args), 2):
             key = extra_args[i][2:]
             value = extra_args[i + 1]
             try:
                 if '[' in value or '{' in value:
-                    value = json.loads(value)
+                    # 尝试 1: 标准 JSON 解析
+                    try:
+                        value_parsed = json.loads(value)
+                    except:
+                        # 尝试 2: 替换单引号为双引号后解析 (针对 ['item_llm'])
+                        try:
+                            value_parsed = json.loads(value.replace("'", '"'))
+                        except:
+                            # 尝试 3: 处理无引号的裸列表 (针对 [item_llm])
+                            if value.startswith('[') and value.endswith(']'):
+                                # 去掉方括号，按逗号分割，并去除空格
+                                content = value[1:-1]
+                                value_parsed = [x.strip() for x in content.split(',') if x.strip()]
+                            else:
+                                raise ValueError(f"Cannot parse list: {value}")
+                    
+                    value = value_parsed
+                    print((f"value :{value}"))
                     if isinstance(value, dict):
                         for k, v in value.items():
                             value[k] = convert_str(v)
@@ -154,9 +172,6 @@ def run_loop(local_rank, config_file=None, saved=True, extra_args=[]):
     logger.info(dataload)
     logger.info('model structure:')
     logger.info(model)
-    print("rec/run.py")
-    print("waiting for input")
-    print_gpu_memory()
     # input()   # 到这里显存使用都不大
 
     # 典型的机器学习模型训练和评估流程

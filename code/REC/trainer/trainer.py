@@ -19,6 +19,7 @@ import torch.optim as optim
 import torch.distributed as dist
 from tqdm import tqdm
 import deepspeed
+from deepspeed.ops.adam import DeepSpeedCPUAdam
 import gc
 
 from ..data.dataset import BatchTextDataset
@@ -74,7 +75,11 @@ class Trainer(object):
         self.best_valid_score = -np.inf if self.valid_metric_bigger else np.inf
         self.best_valid_result = None
         self.train_loss_dict = dict()
-        self.optimizer = self._build_optimizer()
+        if config['cpu_optimizer']:
+            self.logger.info("use cpu oyimizer")
+            self.optimizer = self._build_cpu_optimizer()
+        else:
+            self.optimizer = self._build_optimizer()
         self.update_interval = config['update_interval'] if config['update_interval'] else 20
         self.scheduler_config = config['scheduler_args']
 
@@ -118,8 +123,112 @@ class Trainer(object):
             self.logger.info(f"Use constant scheduler")
             return get_constant_schedule(self.optimizer)
     #？
+
+    def _build_cpu_optimizer(self):
+        # 必须导入 DeepSpeed 的 CPU 优化器
+        from deepspeed.ops.adam import DeepSpeedCPUAdam
+        
+        # 为了方便后续代码书写，我们将 DeepSpeedCPUAdam 赋值给 OptimizerClass
+        # 这样逻辑结构可以和 _build_optimizer 保持完全一致
+        OptimizerClass = DeepSpeedCPUAdam
+
+        if len(self.optim_args) == 4:
+            params = self.model.named_parameters()
+            modal_params = []   # 视觉模态相关参数
+            recsys_params = []  # 推荐系统核心参数
+            modal_decay_params = []  # 模态衰减参数
+            recsys_decay_params = [] # 推荐系统衰减参数
+            decay_check_name = self.config['decay_check_name']
+            
+            for index, (name, param) in enumerate(params):
+                if param.requires_grad:
+                    # 第一级分类：基于参数名称
+                    if 'visual_encoder' in name:
+                        modal_params.append(param) 
+                    else:
+                        recsys_params.append(param) 
+
+                    # 第二级分类：基于衰减检查名称
+                    if decay_check_name:
+                        if decay_check_name in name:
+                            modal_decay_params.append(param) 
+                        else:
+                            recsys_decay_params.append(param) 
+
+            if decay_check_name:
+                # 使用 DeepSpeedCPUAdam
+                optimizer = OptimizerClass([
+                    {
+                        'params': modal_decay_params,
+                        'lr': self.optim_args['modal_lr'],
+                        'weight_decay': self.optim_args['modal_decay']
+                    },
+                    {
+                        'params': recsys_decay_params,
+                        'lr': self.optim_args['rec_lr'],
+                        'weight_decay': self.optim_args['rec_decay']
+                    }
+                ])
+                optim_output = set_color(f'recsys_decay_params_len: {len(recsys_decay_params)}  modal_params_decay_len: {len(modal_decay_params)}', 'blue')
+                self.logger.info(optim_output)
+            else:
+                # 使用 DeepSpeedCPUAdam
+                optimizer = OptimizerClass([
+                    {
+                        'params': modal_params,
+                        'lr': self.optim_args['modal_lr'],
+                        'weight_decay': self.optim_args['modal_decay']
+                    },
+                    {
+                        'params': recsys_params,
+                        'lr': self.optim_args['rec_lr'],
+                        'weight_decay': self.optim_args['rec_decay']
+                    }
+                ])
+                optim_output = set_color(f'recsys_lr_params_len: {len(recsys_params)}  modal_lr_params_len: {len(modal_params)}', 'blue')
+                self.logger.info(optim_output)
+
+        elif self.config['lr_mult_prefix'] and self.config['lr_mult_rate']:
+            normal_params_dict = {
+                "params": [],
+                "lr": self.optim_args['learning_rate'],
+                "weight_decay": self.optim_args['weight_decay']
+            }
+            high_lr_params_dict = {
+                "params": [],
+                "lr": self.optim_args['learning_rate'] * self.config['lr_mult_rate'],
+                "weight_decay": self.optim_args['weight_decay']
+            }
+            self.logger.info(f'Use higher lr rate {self.config["lr_mult_rate"]} x {self.optim_args["learning_rate"]} for prefix {self.config["lr_mult_prefix"]}')
+
+            for n, p in self.model.named_parameters():
+                if any(n.startswith(x) for x in self.config['lr_mult_prefix']):
+                    self.logger.info(f"high lr param: {n} {self.optim_args['learning_rate'] * self.config['lr_mult_rate']}")
+                    high_lr_params_dict["params"].append(p)
+                else:
+                    normal_params_dict["params"].append(p)
+            
+            # 使用 DeepSpeedCPUAdam
+            optimizer = OptimizerClass([normal_params_dict, high_lr_params_dict])
+
+        elif self.config['optimizer_kwargs']:
+            params = self.model.parameters()
+            self.config['optimizer_kwargs']['optimizer']['params']['lr'] = self.optim_args['learning_rate']
+            self.config['optimizer_kwargs']['optimizer']['params']['weight_decay'] = self.optim_args['weight_decay']
+            
+            # 这里本身就是调用 DeepSpeed 的逻辑，直接透传参数
+            optimizer = OptimizerClass(params, **self.config['optimizer_kwargs']['optimizer']['params'])
+            
+        else:
+            params = self.model.parameters()
+            # 使用 DeepSpeedCPUAdam
+            optimizer = OptimizerClass(params, lr=self.optim_args['learning_rate'], weight_decay=self.optim_args['weight_decay'])
+            
+        return optimizer
+    # 根据配置文件（config）中不同的参数设置，灵活地创建不同策略的 PyTorch 优化器
     def _build_optimizer(self):
         if len(self.optim_args) == 4:
+            # 处理多模态推荐模型
             params = self.model.named_parameters()
             modal_params = []  # 视觉模态相关参数
             recsys_params = []  # 推荐系统核心参数
@@ -173,6 +282,7 @@ class Trainer(object):
                 optim_output = set_color(f'recsys_lr_params_len: {len(recsys_params)}  modal_lr_params_len: {len(modal_params)}', 'blue')
                 self.logger.info(optim_output)
         elif self.config['lr_mult_prefix'] and self.config['lr_mult_rate']:
+            # 匹配前缀的参数：使用 base_lr * mult_rate
             normal_params_dict = {
                 "params": [],
                 "lr": self.optim_args['learning_rate'],
@@ -203,6 +313,7 @@ class Trainer(object):
         return optimizer
 
     def _train_epoch(self, train_data, epoch_idx, show_progress=False):
+        self.logger.info("into _train_epoch")
         self.model.train()
         total_loss = 0
         if self.rank == 0:
@@ -215,6 +326,21 @@ class Trainer(object):
             )
         bwd_time = t.time()
         for batch_idx, data in enumerate(train_data):
+            # ================== 【新增：查看批次真实大小】 ==================
+            if batch_idx == 0: # 只看第一个批次
+                # 假设 data 是字典，取出最占内存的 pos_input_ids
+                if isinstance(data, dict) and 'pos_input_ids' in data:
+                    input_tensor = data['pos_input_ids']
+                    print(f"\n>>> [Batch Monitor] Tensor Dim: {input_tensor.dim()}")
+                    print(f">>> [Batch Monitor] Tensor Shape: {input_tensor.shape}")
+                    print(f">>> [Batch Monitor] Total Tokens: {input_tensor.numel()}")
+                
+                    # 估算显存 (假设是 int64, 8 bytes) + Embedding (假设 float16, hidden_dim=4096)
+                    # 这只是纯数据的估算，模型计算时会放大几十倍
+                    est_mem = input_tensor.numel() * 4096 * 2 / 1024**2
+                    print(f">>> [Batch Monitor] Est. Activation Mem (Self-Attn Input): ~{est_mem:.2f} MB")
+        # ================== 【结束】 ==================
+
             start_time = bwd_time
             self.optimizer.zero_grad()
             data = self.to_device(data)
@@ -250,7 +376,9 @@ class Trainer(object):
                 self.logger.info("\n" + "-"*50)
             if self.config['debug'] and batch_idx >= 10:
                 break
-
+            print(f"batch_idx:{batch_idx} waiting for input")
+            self.logger.info(f"Total Reserved Mem (PyTorch Cache): {torch.cuda.memory_reserved():.2f} MB")
+            input()
         return total_loss
 
     def _valid_epoch(self, valid_data, show_progress=False):
@@ -361,44 +489,46 @@ class Trainer(object):
         #分布式训练初始化
         world_size, local_world_size = int(os.environ['WORLD_SIZE']), int(os.environ['LOCAL_WORLD_SIZE'])
         nnodes = world_size // local_world_size
+        print(f"nnodes: {nnodes}")
         precision = self.config['precision'] if self.config['precision'] else '32'
         #分布式的策略
         if self.config['strategy'] == 'deepspeed':
             self.logger.info(f"Use deepspeed strategy")
-            strategy = DeepSpeedStrategy(stage=self.config["stage"], precision=precision)
-            self.lite = L.Fabric(accelerator='gpu', strategy=strategy, precision=precision, num_nodes=nnodes)
+            if self.config['cpu_optimizer']:
+                # 【核心修改】：针对单卡优化配置
+                # stage=2 + offload_optimizer=True 是单卡性价比最高的配置（速度快，省显存）
+                # 如果显存依然不够，可以尝试 stage=3 + offload_parameters=True (速度会变慢)
+                strategy = DeepSpeedStrategy(
+                stage=self.config.get("stage", 2), 
+                precision=precision,
+                offload_optimizer=True,       # 开启：将优化器状态存到 CPU 内存
+                offload_parameters=False,     # 可选：如果是 stage 3，开启此项可进一步将参数存到 CPU
+                offload_params_device='cpu'   # 明确指定卸载到 CPU
+                )
+                self.lite = L.Fabric(accelerator='gpu', devices=1, strategy=strategy, precision=precision, num_nodes=1)
+            else:
+                strategy = DeepSpeedStrategy(stage=self.config["stage"], precision=precision)
+                self.lite = L.Fabric(accelerator='gpu', strategy=strategy, precision=precision, num_nodes=nnodes)
+
         else:
             self.logger.info(f"Use DDP strategy")
             strategy = DDPStrategy(find_unused_parameters=True)
             self.lite = L.Fabric(accelerator='gpu', strategy=strategy, precision=precision, num_nodes=nnodes)
         self.lite.launch()
-        self.model, self.optimizer = self.lite.setup(self.model, self.optimizer)
 
+        # 如果是为了显存使用 cpu 计算优化器的话 传入的优化器必须是 DeepSpeedCPUAdam
+        self.model, self.optimizer = self.lite.setup(self.model, self.optimizer)
+        
+        torch.cuda.empty_cache() # 强制释放缓存
+        print("Cache emptied to release fragmentation.")
+        
         self.logger.info(f"finish load model")
         base_mem = torch.cuda.memory_allocated() / 1024**2
         print(f"fit Loop Start Mem: {base_mem:.2f} MB")   #fit Loop Start Mem: 12611.09 MB
+        # 添加这行代码来验证
+        reserved_mem = torch.cuda.memory_reserved() / 1024**2
+        print(f"Total Reserved Mem (PyTorch Cache): {reserved_mem:.2f} MB")
         input()
-
-        # Wed Nov 26 13:31:18 2025       
-        # +-----------------------------------------------------------------------------------------+
-        # | NVIDIA-SMI 570.172.08             Driver Version: 570.172.08     CUDA Version: 12.8     |
-        # |-----------------------------------------+------------------------+----------------------+
-        # | GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
-        # | Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
-        # |                                         |                        |               MIG M. |
-        # |=========================================+========================+======================|
-        # |   0  NVIDIA GeForce RTX 4090        Off |   00000000:84:00.0 Off |                  Off |
-        # | 46%   28C    P8             31W /  450W |   21701MiB /  24564MiB |      0%      Default |
-        # |                                         |                        |                  N/A |
-        # +-----------------------------------------+------------------------+----------------------+
-                                                                                                
-        # +-----------------------------------------------------------------------------------------+
-        # | Processes:                                                                              |
-        # |  GPU   GI   CI              PID   Type   Process name                        GPU Memory |
-        # |        ID   ID                                                               Usage      |
-        # |=========================================================================================|
-        # +-----------------------------------------------------------------------------------------+
-
         #自动恢复机制
         if self.config['auto_resume']:
             raise NotImplementedError
@@ -407,6 +537,8 @@ class Trainer(object):
 
         #主训练循环
         for epoch_idx in range(self.start_epoch, self.epochs):
+            self.logger.info(f"epoch_idx:{epoch_idx}")
+            self.logger.info(f"Total Reserved Mem (PyTorch Cache): {torch.cuda.memory_reserved():.2f} MB")
             # train
             if self.config['need_training'] == None or self.config['need_training']:
                 # 每个 epoch 中数据的随机洗牌（Shuffle）方式不同

@@ -48,7 +48,7 @@ class HLLM(BaseModel):
         self.item_llm = self.create_llm(self.item_pretrain_dir, config['item_llm_init'])
         self.logger.info(f"create user llm")
         self.user_llm = self.create_llm(self.user_pretrain_dir, config['user_llm_init'])
-        # input()    # 545 M
+        # input()
         # 可学习的物品嵌入token
         self.item_emb_token_n = config['item_emb_token_n']
         if self.item_emb_token_n > 1:
