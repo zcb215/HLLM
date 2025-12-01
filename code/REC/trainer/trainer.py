@@ -21,6 +21,7 @@ from tqdm import tqdm
 import deepspeed
 from deepspeed.ops.adam import DeepSpeedCPUAdam
 import gc
+import bitsandbytes as bnb
 
 from ..data.dataset import BatchTextDataset
 from ..data.dataset.collate_fn import customize_rmpad_collate
@@ -78,6 +79,9 @@ class Trainer(object):
         if config['cpu_optimizer']:
             self.logger.info("use cpu oyimizer")
             self.optimizer = self._build_cpu_optimizer()
+        elif config['use_8-bit_optim']:
+            self.logger.info("use 8-bit optimizer")
+            self.optimizer = self._build_smaller_optimizer()
         else:
             self.optimizer = self._build_optimizer()
         self.update_interval = config['update_interval'] if config['update_interval'] else 20
@@ -312,6 +316,27 @@ class Trainer(object):
             optimizer = optim.AdamW(params, lr=self.optim_args['learning_rate'], weight_decay=self.optim_args['weight_decay'])
         return optimizer
 
+    def _build_smaller_optimizer(self):
+        self.logger.info(">>> 使用 bitsandbytes 8-bit 优化器以节省显存 <<<")
+        
+        # 筛选需要梯度的参数
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        
+        # 使用 8-bit AdamW
+        # 这会将优化器状态压缩 75%，从而无需 Offload 也能塞进显存
+        # optimizer = bnb.optim.AdamW8bit(
+        #     trainable_params,
+        #     lr=self.optim_args['learning_rate'],
+        #     weight_decay=self.optim_args['weight_decay']
+        # )
+        
+        optimizer = bnb.optim.PagedAdamW8bit(
+            trainable_params,
+            lr=self.optim_args['learning_rate'],
+            weight_decay=self.optim_args['weight_decay']
+        )
+        return optimizer
+    
     def _train_epoch(self, train_data, epoch_idx, show_progress=False):
         self.logger.info("into _train_epoch")
         self.model.train()
@@ -378,7 +403,6 @@ class Trainer(object):
                 break
             print(f"batch_idx:{batch_idx} waiting for input")
             self.logger.info(f"Total Reserved Mem (PyTorch Cache): {torch.cuda.memory_reserved():.2f} MB")
-            input()
         return total_loss
 
     def _valid_epoch(self, valid_data, show_progress=False):
@@ -506,6 +530,10 @@ class Trainer(object):
                 offload_params_device='cpu'   # 明确指定卸载到 CPU
                 )
                 self.lite = L.Fabric(accelerator='gpu', devices=1, strategy=strategy, precision=precision, num_nodes=1)
+            elif self.config['use_8-bit_optim']:
+                # 使用 8-bit 优化器时，推荐使用 DeepSpeed Stage 2
+                strategy = DeepSpeedStrategy(stage=self.config["stage"], precision=precision)
+                self.lite = L.Fabric(accelerator='gpu', strategy=strategy, precision=precision, num_nodes=nnodes)
             else:
                 strategy = DeepSpeedStrategy(stage=self.config["stage"], precision=precision)
                 self.lite = L.Fabric(accelerator='gpu', strategy=strategy, precision=precision, num_nodes=nnodes)
@@ -528,7 +556,7 @@ class Trainer(object):
         # 添加这行代码来验证
         reserved_mem = torch.cuda.memory_reserved() / 1024**2
         print(f"Total Reserved Mem (PyTorch Cache): {reserved_mem:.2f} MB")
-        input()
+        # input()
         #自动恢复机制
         if self.config['auto_resume']:
             raise NotImplementedError
@@ -609,14 +637,14 @@ class Trainer(object):
         return self.best_valid_score, self.best_valid_result
 
 
-    '''
-    user:用户标识
-    time_seq::时间序列(可能用于时序建模)
-    history_index:用户历史交互过的物品索引（用于排除已交互物品）
-    positive_u / positive_i:正样本用户和物品（用于评估）
-    '''
+    # user:用户标识
+    # time_seq::时间序列(可能用于时序建模)
+    # history_index:用户历史交互过的物品索引（用于排除已交互物品）
+    # positive_u / positive_i:正样本用户和物品（用于评估）
+    
     @torch.no_grad()
     def _full_sort_batch_eval(self, batched_data):
+        print(f"into _full_sort_batch_eval")
         user, time_seq, history_index, positive_u, positive_i = batched_data
         interaction = self.to_device(user)
         time_seq = self.to_device(time_seq)
@@ -656,10 +684,9 @@ class Trainer(object):
             scores[history_index] = -np.inf
         return scores, positive_u, positive_i
 
-    '''
-    实现的是物品特征预计算(compute_item_feature)功能
-    利用HLLM中的Item LLM将物品文本描述转换为固定维度的嵌入向量
-    '''
+    # 实现的是物品特征预计算(compute_item_feature)功能
+    # 利用HLLM中的Item LLM将物品文本描述转换为固定维度的嵌入向量
+
     @torch.no_grad()
     def compute_item_feature(self, config, data):
         if self.use_text:
@@ -676,38 +703,38 @@ class Trainer(object):
 
                     # 【修改点 2】：计算完成后立即移回 CPU
                     # 目的：避免 GPU 显存中积累大量计算图或张量，释放显存给后续批次
-                    if isinstance(items, tuple):
-                        items = tuple(x.cpu() for x in items)
-                    else:
-                        items = items.cpu()
+                    # if isinstance(items, tuple):
+                    #     items = tuple(x.cpu() for x in items)
+                    # else:
+                    #     items = items.cpu()
 
                     self.item_feature.append(items)
                 # 处理单输出或多输出情况
                 # 物品可能有多种特征：图像特征 + 文本特征  这里是尝试将特征划分开了
-                # if isinstance(items, tuple):
-                #     self.item_feature = torch.cat([x[0] for x in self.item_feature]), torch.cat([x[1] for x in self.item_feature])
-                # else:
-                #     self.item_feature = torch.cat(self.item_feature)
-                # if self.config['stage'] == 3:
-                #     self.item_feature = self.item_feature.bfloat16()
+                if isinstance(items, tuple):
+                    self.item_feature = torch.cat([x[0] for x in self.item_feature]), torch.cat([x[1] for x in self.item_feature])
+                else:
+                    self.item_feature = torch.cat(self.item_feature)
+                if self.config['stage'] == 3:
+                    self.item_feature = self.item_feature.bfloat16()
 
 
                 # 【修改点 3】：拼接操作在 CPU 上进行
                 # 因为 list 中的元素已经是 CPU 张量了，torch.cat 会在 CPU 内存中分配空间，不占用显存
-                if isinstance(self.item_feature[0], tuple): # 检查第一个元素是否为 tuple
-                    # 假设结构是 [(feat1_batch1, feat2_batch1), (feat1_batch2, feat2_batch2), ...]
-                    # 我们需要将其转变为 (cat(feat1_all), cat(feat2_all))
-                    feat1 = torch.cat([x[0] for x in self.item_feature])
-                    feat2 = torch.cat([x[1] for x in self.item_feature])
-                    self.item_feature = (feat1, feat2)
-                else:
-                    self.item_feature = torch.cat(self.item_feature)
-                # 类型转换也在 CPU 上完成
-                if self.config['stage'] == 3:
-                    if isinstance(self.item_feature, tuple):
-                        self.item_feature = tuple(x.bfloat16() for x in self.item_feature)
-                    else:
-                        self.item_feature = self.item_feature.bfloat16()
+                # if isinstance(self.item_feature[0], tuple): # 检查第一个元素是否为 tuple
+                #     # 假设结构是 [(feat1_batch1, feat2_batch1), (feat1_batch2, feat2_batch2), ...]
+                #     # 我们需要将其转变为 (cat(feat1_all), cat(feat2_all))
+                #     feat1 = torch.cat([x[0] for x in self.item_feature])
+                #     feat2 = torch.cat([x[1] for x in self.item_feature])
+                #     self.item_feature = (feat1, feat2)
+                # else:
+                #     self.item_feature = torch.cat(self.item_feature)
+                # # 类型转换也在 CPU 上完成
+                # if self.config['stage'] == 3:
+                #     if isinstance(self.item_feature, tuple):
+                #         self.item_feature = tuple(x.bfloat16() for x in self.item_feature)
+                #     else:
+                #         self.item_feature = self.item_feature.bfloat16()
         else:
             with torch.no_grad():
                 self.item_feature = self.model.module.compute_item_all()
@@ -783,20 +810,13 @@ class Trainer(object):
             base_mem = torch.cuda.memory_allocated() / 1024**2
             print(f"Loop Start Mem: {base_mem:.2f} MB")
             for batch_idx, batched_data in enumerate(iter_data):
-                # # 【监控 1】批次开始
-                # mem_1 = torch.cuda.memory_allocated() / 1024**2
                 start_time = fwd_time
                 data_time = t.time()
                 scores, positive_u, positive_i = eval_func(batched_data)
-                # 【监控 2】推理完成后 (如果这里激增，说明是 scores 张量太大)
-                # mem_2 = torch.cuda.memory_allocated() / 1024**2
                 fwd_time = t.time()
                 if show_progress and self.rank == 0:
                     iter_data.set_postfix_str(f"data: {data_time-start_time:.3f} fwd: {fwd_time-data_time:.3f}", refresh=False)
                 self.eval_collector.eval_batch_collect(scores, positive_u, positive_i)
-                # 【监控 3】收集完成后 (如果这里比 mem_1 持续增加，说明 collector 把 GPU 张量存起来了)
-                # mem_3 = torch.cuda.memory_allocated() / 1024**2
-                # 打印显存变化详情
 
             num_total_examples = len(eval_data.sampler.dataset)
             struct = self.eval_collector.get_data_struct()
@@ -809,3 +829,412 @@ class Trainer(object):
             self.wandblogger.log_eval_metrics(result, head='eval')
 
             return result
+
+            
+
+'''
+import os
+import sys
+from logging import getLogger
+from time import time
+import time as t
+import numpy as np
+import torch
+import torch.optim as optim
+import torch.distributed as dist
+from tqdm import tqdm
+import bitsandbytes as bnb  # <--- 必须确保安装了 bitsandbytes
+
+from ..data.dataset import BatchTextDataset
+from ..data.dataset.collate_fn import customize_rmpad_collate
+from torch.utils.data import DataLoader
+from ..evaluator import Evaluator, Collector
+from ..utils import ensure_dir, get_local_time, early_stopping, calculate_valid_score, dict2str, \
+    get_tensorboard, set_color, get_gpu_usage, WandbLogger
+from ..utils.lr_scheduler import *
+
+import lightning as L
+from lightning.fabric.strategies import DeepSpeedStrategy, DDPStrategy
+
+class Trainer(object):
+    def __init__(self, config, model):
+        super(Trainer, self).__init__()
+        self.config = config
+        self.model = model
+        self.logger = getLogger()
+        self.wandblogger = WandbLogger(config)
+        self.optim_args = config['optim_args']
+        self.epochs = config['epochs']
+        self.eval_step = min(config['eval_step'], self.epochs)
+        self.stopping_step = config['stopping_step']
+        self.clip_grad_norm = config.get('clip_grad_norm', 1.0)
+        self.valid_metric = config['valid_metric'].lower()
+        self.valid_metric_bigger = config['valid_metric_bigger']
+        self.test_batch_size = config['eval_batch_size']
+        self.gpu_available = torch.cuda.is_available() and config['use_gpu']
+        self.device = config['device']
+        self.rank = torch.distributed.get_rank()
+        if self.rank == 0:
+            self.tensorboard = get_tensorboard(self.logger)
+
+        self.checkpoint_dir = config['checkpoint_dir']
+        if self.rank == 0:
+            ensure_dir(self.checkpoint_dir)
+
+        self.saved_model_name = '{}-{}.pth'.format(self.config['model'], 0)
+        self.saved_model_file = os.path.join(self.checkpoint_dir, self.saved_model_name)
+        self.use_text = config['use_text']
+        self.start_epoch = 0
+        self.cur_step = 0
+        self.best_valid_score = -np.inf if self.valid_metric_bigger else np.inf
+        self.best_valid_result = None
+        self.train_loss_dict = dict()
+        
+        # === [核心修复 1] 强制使用 8-bit 优化器构建函数 ===
+        self.optimizer = self._build_optimizer()
+        
+        self.update_interval = config['update_interval'] if config['update_interval'] else 20
+        self.scheduler_config = config['scheduler_args']
+
+        # === [核心修复 2] freeze_prefix 鲁棒性处理 (解决 extend 报错) ===
+        if config['freeze_prefix'] or config['freeze_ad']:
+            freeze_prefix = config['freeze_prefix'] if config['freeze_prefix'] else []
+            
+            # 强制转为列表，防止传入字符串导致报错
+            if isinstance(freeze_prefix, str):
+                # 尝试解析潜在的列表字符串
+                if freeze_prefix.startswith('[') and freeze_prefix.endswith(']'):
+                    try:
+                        import json
+                        # 替换单引号为双引号以符合 JSON 标准
+                        freeze_prefix = json.loads(freeze_prefix.replace("'", '"'))
+                    except:
+                        freeze_prefix = [freeze_prefix]
+                else:
+                    freeze_prefix = [freeze_prefix]
+            
+            if config['freeze_ad']:
+                freeze_prefix.extend(['item_llm', 'item_emb_tokens'])
+            if not config['ft_item']:
+                freeze_prefix.extend(['item_embedding'])
+            self._freeze_params(freeze_prefix)
+
+        for n, p in self.model.named_parameters():
+            self.logger.info(f"{n} {p.size()} {p.requires_grad}")
+
+        self.eval_collector = Collector(config)
+        self.evaluator = Evaluator(config)
+        self.item_feature = None
+        self.tot_item_num = None
+
+    def _freeze_params(self, freeze_prefix):
+        for name, param in self.model.named_parameters():
+            for prefix in freeze_prefix:
+                if name.startswith(prefix):
+                    self.logger.info(f"freeze_params: {name}")
+                    param.requires_grad = False
+
+    def _build_scheduler(self, warmup_steps=None, tot_steps=None):
+        if self.scheduler_config['type'] == 'cosine':
+            return get_cosine_schedule_with_warmup(self.optimizer, warmup_steps, tot_steps)
+        elif self.scheduler_config['type'] == 'liner':
+            return get_linear_schedule_with_warmup(self.optimizer, warmup_steps, tot_steps)
+        else:
+            return get_constant_schedule(self.optimizer)
+
+    def _build_optimizer(self):
+        # === [核心修复 3] 移除旧逻辑，强制启用 8-bit AdamW ===
+        self.logger.info(">>> [System] Forcing use of 8-bit AdamW (bitsandbytes) to save VRAM <<<")
+        
+        # 筛选出需要梯度的参数
+        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        
+        # 使用 8-bit 优化器
+        # optimizer = bnb.optim.AdamW8bit(
+        #     trainable_params,
+        #     lr=self.optim_args['learning_rate'],
+        #     weight_decay=self.optim_args['weight_decay']
+        # )
+        # 使用 Paged 优化器
+        optimizer = bnb.optim.PagedAdamW8bit(
+            trainable_params,
+            lr=self.optim_args['learning_rate'],
+            weight_decay=self.optim_args['weight_decay']
+        )
+        return optimizer
+
+    def _train_epoch(self, train_data, epoch_idx, show_progress=False):
+        self.logger.info("into _train_epoch")
+        self.model.train()
+        total_loss = 0
+        if self.rank == 0:
+            pbar = tqdm(total=len(train_data), miniters=self.update_interval, desc=set_color(f"Train [{epoch_idx:>3}/{self.epochs:>3}]", 'pink'), file=sys.stdout)
+        
+        bwd_time = t.time()
+        for batch_idx, data in enumerate(train_data):
+            # [监控] 打印显存状态，确认优化器 Step 时的行为
+            if batch_idx == 0:
+                 mem_before = torch.cuda.memory_allocated() / 1024**2
+                 print(f">>> [Batch 0] Mem before step: {mem_before:.2f} MB")
+
+            start_time = bwd_time
+            self.optimizer.zero_grad()
+            data = self.to_device(data)
+            data_time = t.time()
+            
+            losses = self.model(data)
+            fwd_time = t.time()
+            
+            if self.config['loss'] and self.config['loss'] == 'nce':
+                model_out = losses
+                losses = model_out.pop('loss')
+            
+            self._check_nan(losses)
+            total_loss = total_loss + losses.item()
+            
+            self.lite.backward(losses)
+            
+            grad_norm = None
+            if self.clip_grad_norm:
+                grad_norm = self.lite.clip_gradients(self.model, self.optimizer, max_norm=self.clip_grad_norm)
+            
+            # 这里是之前报错的地方，更换优化器后显存占用应大幅降低
+            self.optimizer.step()
+            
+            # [监控] Step 之后
+            if batch_idx == 0:
+                 mem_after = torch.cuda.memory_allocated() / 1024**2
+                 print(f">>> [Batch 0] Mem after step: {mem_after:.2f} MB (Delta: {mem_after - mem_before:.2f} MB)")
+
+            bwd_time = t.time()
+            if self.scheduler_config:
+                self.lr_scheduler.step()
+                
+            if show_progress and self.rank == 0 and batch_idx % self.update_interval == 0:
+                msg = f"loss: {losses:.4f} data: {data_time-start_time:.3f} fwd: {fwd_time-data_time:.3f} bwd: {bwd_time-fwd_time:.3f}"
+                if self.scheduler_config:
+                    msg = f"lr: {self.lr_scheduler.get_lr()[0]:.7f} " + msg
+                pbar.set_postfix_str(msg, refresh=False)
+                pbar.update(self.update_interval)
+
+            # Debug 模式
+            if self.config['debug'] and batch_idx >= 10:
+                break
+        return total_loss
+
+    def _valid_epoch(self, valid_data, show_progress=False):
+        torch.distributed.barrier()
+        valid_result = self.evaluate(valid_data, load_best_model=False, show_progress=show_progress)
+        valid_score = calculate_valid_score(valid_result, self.valid_metric)
+        torch.distributed.barrier()
+        return valid_score, valid_result
+
+    def _save_checkpoint(self, epoch, verbose=True):
+        state = {
+            "model": self.model,
+            "optimizer": self.optimizer,
+            'config': self.config,
+            'epoch': epoch,
+            'cur_step': self.cur_step,
+            'best_valid_score': self.best_valid_score,
+            'rng_state': torch.get_rng_state(),
+            'cuda_rng_state': torch.cuda.get_rng_state()
+        }
+        self.lite.save(os.path.join(self.checkpoint_dir, self.saved_model_name), state=state)
+        if self.rank == 0 and verbose:
+            self.logger.info(set_color('Saving current', 'blue') + f': {self.saved_model_file}')
+
+    def _check_nan(self, loss):
+        if torch.isnan(loss):
+            raise ValueError('Training loss is nan')
+
+    def _generate_train_loss_output(self, epoch_idx, s_time, e_time, losses):
+        des = self.config['loss_decimal_place'] or 4
+        train_loss_output = (set_color('epoch %d training', 'green') + ' [' + set_color('time', 'blue') +
+                             ': %.2fs, ') % (epoch_idx, e_time - s_time)
+        if isinstance(losses, tuple):
+            des = (set_color('train_loss%d', 'blue') + ': %.' + str(des) + 'f')
+            train_loss_output += ', '.join(des % (idx + 1, loss) for idx, loss in enumerate(losses))
+        else:
+            des = '%.' + str(des) + 'f'
+            train_loss_output += set_color('train loss', 'blue') + ': ' + des % losses
+        return train_loss_output + ']'
+
+    def _add_train_loss_to_tensorboard(self, epoch_idx, losses, tag='Loss/Train'):
+        if isinstance(losses, tuple):
+            for idx, loss in enumerate(losses):
+                self.tensorboard.add_scalar(tag + str(idx), loss, epoch_idx)
+        else:
+            self.tensorboard.add_scalar(tag, losses, epoch_idx)
+
+    def to_device(self, data):
+        device = self.device
+        if isinstance(data, dict):
+            for k, v in data.items():
+                data[k] = v.to(device)
+            return data
+        return data.to(device)
+
+    def fit(self, train_data, valid_data=None, verbose=True, saved=True, show_progress=False, callback_fn=None):
+        if self.scheduler_config:
+            warmup_rate = self.scheduler_config.get('warmup', 0.001)
+            tot_steps = len(train_data) * self.epochs
+            warmup_steps = tot_steps * warmup_rate
+            self.lr_scheduler = self._build_scheduler(warmup_steps=warmup_steps, tot_steps=tot_steps)
+
+        world_size = int(os.environ.get('WORLD_SIZE', 1))
+        local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', 1))
+        nnodes = world_size // local_world_size
+        precision = self.config['precision'] if self.config['precision'] else '32'
+
+        # === [核心修复 4] 强制使用 DDP 策略，因为 bitsandbytes 在 DeepSpeed 下需要特殊配置，简单起见用 DDP ===
+        self.logger.info(">>> Strategy: DDP with 8-bit Optimizer <<<")
+        strategy = DDPStrategy(find_unused_parameters=True)
+        self.lite = L.Fabric(accelerator='gpu', strategy=strategy, precision=precision, num_nodes=nnodes)
+        
+        self.lite.launch()
+
+        self.model, self.optimizer = self.lite.setup(self.model, self.optimizer)
+        
+        torch.cuda.empty_cache()
+        self.logger.info(f"finish load model")
+        
+        # 验证优化器类型
+        print(f"Optimizer Class: {type(self.optimizer)}")
+        input()
+        for epoch_idx in range(self.start_epoch, self.epochs):
+            if self.config['need_training'] == None or self.config['need_training']:
+                train_data.sampler.set_epoch(epoch_idx)
+                training_start_time = time()
+                train_loss = self._train_epoch(train_data, epoch_idx, show_progress=show_progress)
+                self.train_loss_dict[epoch_idx] = sum(train_loss) if isinstance(train_loss, tuple) else train_loss
+                training_end_time = time()
+                train_loss_output = self._generate_train_loss_output(epoch_idx, training_start_time, training_end_time, train_loss)
+                
+                if verbose:
+                    self.logger.info(train_loss_output)
+                if self.rank == 0:
+                    self._add_train_loss_to_tensorboard(epoch_idx, train_loss)
+                self.wandblogger.log_metrics({'epoch': epoch_idx, 'train_loss': train_loss, 'train_step': epoch_idx}, head='train')
+
+            if self.eval_step <= 0 or not valid_data:
+                if saved:
+                    self._save_checkpoint(epoch_idx, verbose=verbose)
+                continue
+
+            if (epoch_idx + 1) % self.eval_step == 0:
+                valid_score, valid_result = self._valid_epoch(valid_data, show_progress=show_progress)
+                self.best_valid_score, self.cur_step, stop_flag, update_flag = early_stopping(
+                    valid_score, self.best_valid_score, self.cur_step, max_step=self.stopping_step, bigger=self.valid_metric_bigger
+                )
+                valid_result_output = set_color('valid result', 'blue') + ': \n' + dict2str(valid_result)
+                if verbose:
+                    self.logger.info(valid_result_output)
+                self.wandblogger.log_metrics({**valid_result}, head='valid')
+
+                if update_flag:
+                    if saved:
+                        self._save_checkpoint(epoch_idx, verbose=verbose)
+                    self.best_valid_result = valid_result
+                
+                if stop_flag:
+                    break
+
+        return self.best_valid_score, self.best_valid_result
+
+    #  (后续 evaluate 等代码可以保持原样，或者你之前发给我的那部分) 
+    @torch.no_grad()
+    def _full_sort_batch_eval(self, batched_data):
+        user, time_seq, history_index, positive_u, positive_i = batched_data
+        interaction = self.to_device(user)
+        time_seq = self.to_device(time_seq)
+        if isinstance(self.item_feature, tuple):
+            batch_item_feature = tuple(x.to(self.device) for x in self.item_feature)
+        else:
+            batch_item_feature = self.item_feature.to(self.device)
+
+        scores = self.model.module.predict(interaction, time_seq, batch_item_feature)
+        scores = scores.view(-1, self.tot_item_num)
+        scores[:, 0] = -np.inf
+        if history_index is not None:
+            scores[history_index] = -np.inf
+        return scores, positive_u, positive_i
+
+    @torch.no_grad()
+    def compute_item_feature(self, config, data):
+        if self.use_text:
+            item_data = BatchTextDataset(config, data)
+            item_batch_size = config['MAX_ITEM_LIST_LENGTH'] * config['train_batch_size']
+            item_loader = DataLoader(item_data, batch_size=item_batch_size, num_workers=2, shuffle=False, pin_memory=True, collate_fn=customize_rmpad_collate)
+            self.logger.info(f"Inference item_data with {item_batch_size = } {len(item_loader) = }")
+            self.item_feature = []
+            with torch.no_grad():
+                for idx, items in tqdm(enumerate(item_loader), total=len(item_loader)):
+                    items = self.to_device(items)
+                    items = self.model(items, mode='compute_item')
+                    if isinstance(items, tuple):
+                        items = tuple(x.cpu() for x in items)
+                    else:
+                        items = items.cpu()
+                    self.item_feature.append(items)
+                
+                if isinstance(self.item_feature[0], tuple):
+                    feat1 = torch.cat([x[0] for x in self.item_feature])
+                    feat2 = torch.cat([x[1] for x in self.item_feature])
+                    self.item_feature = (feat1, feat2)
+                else:
+                    self.item_feature = torch.cat(self.item_feature)
+        else:
+            with torch.no_grad():
+                self.item_feature = self.model.module.compute_item_all()
+
+    def distributed_concat(self, tensor, num_total_examples):
+        output_tensors = [tensor.clone() for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather(output_tensors, tensor)
+        concat = torch.cat(output_tensors, dim=0)
+        return concat.sum() / num_total_examples
+
+    def evaluate(self, eval_data, load_best_model=True, model_file=None, show_progress=False, init_model=False):
+        if not eval_data:
+            return
+        if init_model:
+            world_size = int(os.environ.get('WORLD_SIZE', 1))
+            local_world_size = int(os.environ.get('LOCAL_WORLD_SIZE', 1))
+            nnodes = world_size // local_world_size
+            precision = self.config['precision'] if self.config['precision'] else '32'
+            strategy = DDPStrategy(find_unused_parameters=True)
+            self.lite = L.Fabric(accelerator='gpu', strategy=strategy, precision=precision, num_nodes=nnodes)
+            self.lite.launch()
+            self.model = self.lite.setup(self.model)
+
+        if load_best_model:
+            checkpoint_file = model_file or self.saved_model_file
+            state = {"model": self.model}
+            self.lite.load(checkpoint_file, state)
+            message_output = 'Loading model structure and parameters from {}'.format(checkpoint_file)
+            self.logger.info(message_output)
+
+        with torch.no_grad():   
+            self.model.eval()
+            eval_func = self._full_sort_batch_eval
+            self.tot_item_num = eval_data.dataset.dataload.item_num
+            self.compute_item_feature(self.config, eval_data.dataset.dataload)
+            iter_data = (
+                tqdm(eval_data, total=len(eval_data), ncols=150, desc=set_color(f"Evaluate   ", 'pink'), file=sys.stdout)
+                if show_progress and self.rank == 0 else eval_data
+            )
+            for batch_idx, batched_data in enumerate(iter_data):
+                scores, positive_u, positive_i = eval_func(batched_data)
+                self.eval_collector.eval_batch_collect(scores, positive_u, positive_i)
+
+            num_total_examples = len(eval_data.sampler.dataset)
+            struct = self.eval_collector.get_data_struct()
+            result = self.evaluator.evaluate(struct)
+            metric_decimal_place = 5 if self.config['metric_decimal_place'] == None else self.config['metric_decimal_place']
+            for k, v in result.items():
+                result_cpu = self.distributed_concat(torch.tensor([v]).to(self.device), num_total_examples).cpu()
+                result[k] = round(result_cpu.item(), metric_decimal_place)
+            self.wandblogger.log_eval_metrics(result, head='eval')
+            return result
+        
+'''

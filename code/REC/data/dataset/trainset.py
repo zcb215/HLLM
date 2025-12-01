@@ -397,7 +397,7 @@ class TextSEQTrainDataset(Dataset):
             )
             mask = [1] * len(ids)
             return ids, mask
-
+        # [0] * self.item_emb_token_n  这里的 0 实际上就是item模型的占位符
         for item in item_seq_token:
             ids, _ = process_item(item)
             pos_input_ids.extend(ids + [0] * self.item_emb_token_n)

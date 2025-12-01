@@ -296,6 +296,7 @@ class HLLM(BaseModel):
         user_embedding = self.user_llm(inputs_embeds=pos_embedding, attention_mask=attention_mask).hidden_states[-1]
         seq_output = user_embedding[:, -1]
         seq_output = seq_output / seq_output.norm(dim=-1, keepdim=True)
+        # 对所有候选物品向量做归一化，以便后续通过点积计算余弦相似度   爆显存的话考虑分块计算
         item_feature = item_feature / item_feature.norm(dim=-1, keepdim=True)
 
         return torch.matmul(seq_output, item_feature.t())

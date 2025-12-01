@@ -72,7 +72,7 @@ class Data:
         remap_list = ['user_id', 'item_id']
         for feature in remap_list:
             if feature == 'item_id' and self.item_data:
-                feats = self.item_feat[feature]
+                feats = self.item_feat[feature]  # 来源 A：物品详情表
                 feats_raw = self.inter_feat[feature]
             else:
                 feats = self.inter_feat[feature]
@@ -91,6 +91,7 @@ class Data:
             # print(f"mp:\n {mp}")
             # input()
             token_id = {t: i for i, t in enumerate(mp)}
+            # 下面是补充存在物品集合里面但是没有交互过的物品 id
             if feature == 'item_id' and self.item_data:
                 _, raw_mp = pd.factorize(feats_raw)
                 for x in raw_mp:
