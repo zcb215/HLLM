@@ -351,21 +351,6 @@ class Trainer(object):
             )
         bwd_time = t.time()
         for batch_idx, data in enumerate(train_data):
-            # ================== 【新增：查看批次真实大小】 ==================
-            if batch_idx == 0: # 只看第一个批次
-                # 假设 data 是字典，取出最占内存的 pos_input_ids
-                if isinstance(data, dict) and 'pos_input_ids' in data:
-                    input_tensor = data['pos_input_ids']
-                    print(f"\n>>> [Batch Monitor] Tensor Dim: {input_tensor.dim()}")
-                    print(f">>> [Batch Monitor] Tensor Shape: {input_tensor.shape}")
-                    print(f">>> [Batch Monitor] Total Tokens: {input_tensor.numel()}")
-                
-                    # 估算显存 (假设是 int64, 8 bytes) + Embedding (假设 float16, hidden_dim=4096)
-                    # 这只是纯数据的估算，模型计算时会放大几十倍
-                    est_mem = input_tensor.numel() * 4096 * 2 / 1024**2
-                    print(f">>> [Batch Monitor] Est. Activation Mem (Self-Attn Input): ~{est_mem:.2f} MB")
-        # ================== 【结束】 ==================
-
             start_time = bwd_time
             self.optimizer.zero_grad()
             data = self.to_device(data)
@@ -653,30 +638,30 @@ class Trainer(object):
         # 此时 self.item_feature 存储在 CPU 上，但模型在 GPU 上。
         # 我们需要在推理前将其移动到 GPU。
         # 注意：如果显存非常紧张，移动整个大张量可能会再次 OOM，但在拼接阶段已经省下了大量显存，通常这里能放下。
-        if isinstance(self.item_feature, tuple):
-            # 如果是元组（如图像+文本特征），分别移动到 GPU
-            batch_item_feature = tuple(x.to(self.device) for x in self.item_feature)
-        else:
-            # 如果是单个张量，直接移动到 GPU
-            batch_item_feature = self.item_feature.to(self.device)
-
-        if self.config['model'] == 'HLLM':
-            # HLLM 且处于第 3 阶段（部署阶段），使用 self.model.module.predict 进行推理
-            if self.config['stage'] == 3:
-                scores = self.model.module.predict(interaction, time_seq, batch_item_feature)
-            else:
-                scores = self.model((interaction, time_seq, batch_item_feature), mode='predict')
-        else:
-            scores = self.model.module.predict(interaction, time_seq, batch_item_feature)
+        # if isinstance(self.item_feature, tuple):
+        #     # 如果是元组（如图像+文本特征），分别移动到 GPU
+        #     batch_item_feature = tuple(x.to(self.device) for x in self.item_feature)
+        # else:
+        #     # 如果是单个张量，直接移动到 GPU
+        #     batch_item_feature = self.item_feature.to(self.device)
 
         # if self.config['model'] == 'HLLM':
-        #     #HLLM 且处于第 3 阶段（部署阶段），使用 self.model.module.predict 进行推理
+        #     # HLLM 且处于第 3 阶段（部署阶段），使用 self.model.module.predict 进行推理
         #     if self.config['stage'] == 3:
-        #         scores = self.model.module.predict(interaction, time_seq, self.item_feature)
+        #         scores = self.model.module.predict(interaction, time_seq, batch_item_feature)
         #     else:
-        #         scores = self.model((interaction, time_seq, self.item_feature), mode='predict')
+        #         scores = self.model((interaction, time_seq, batch_item_feature), mode='predict')
         # else:
-        #     scores = self.model.module.predict(interaction, time_seq, self.item_feature)
+        #     scores = self.model.module.predict(interaction, time_seq, batch_item_feature)
+
+        if self.config['model'] == 'HLLM':
+            #HLLM 且处于第 3 阶段（部署阶段），使用 self.model.module.predict 进行推理
+            if self.config['stage'] == 3:
+                scores = self.model.module.predict(interaction, time_seq, self.item_feature)
+            else:
+                scores = self.model((interaction, time_seq, self.item_feature), mode='predict')
+        else:
+            scores = self.model.module.predict(interaction, time_seq, self.item_feature)
         scores = scores.view(-1, self.tot_item_num)
         scores[:, 0] = -np.inf
         if history_index is not None:
