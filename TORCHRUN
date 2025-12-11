@@ -7,14 +7,15 @@ if [[ "$master_addr" == "" && "$master_port" == "" ]]; then
   node_rank=0
   master_port=12345
   nproc_per_node=${nproc_per_node:=$(nvidia-smi --list-gpus | wc -l)}
-  /root/miniconda3/envs/HLLM/bin/torchrun \
+  #/root/miniconda3/envs/HLLM/bin/torchrun \
+  /root/autodl-pvt/envs/HLLM/bin/torchrun \
   --master_port=$master_port \
   --node_rank=$node_rank \
   --nproc_per_node=$nproc_per_node \
   --nnodes=$nnodes \
   "$@"
 else
-  /root/miniconda3/envs/HLLM/bin/torchrun \
+  /root/autodl-pvt/envs/HLLM/bin/torchrun \
   --master_addr=$master_addr \
   --master_port=$master_port \
   --node_rank=$node_rank \

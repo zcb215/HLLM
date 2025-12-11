@@ -2,7 +2,7 @@
 
 set -euo pipefail
 # 添加这行解决碎片化问题
-# export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 MODEL_DIR="${MODEL_DIR:-TinyLlama/TinyLlama-1.1B-Chat-v1.0}"
 
 cd code
@@ -15,11 +15,11 @@ python3 main.py \
     --train_batch_size 1 \
     --MAX_TEXT_LENGTH 256 \
     --MAX_ITEM_LIST_LENGTH 10 \
-    --checkpoint_dir /root/autodl-tmp/HLLM/checkpoints \
+    --checkpoint_dir /root/autodl-pvt/HLLM/checkpoints \
     --optim_args.learning_rate 1e-4 \
     --item_pretrain_dir "$MODEL_DIR" \
     --user_pretrain_dir "$MODEL_DIR" \
-    --text_path /root/autodl-tmp/HLLM/information \
+    --text_path /root/autodl-pvt/HLLM/information \
     --text_keys '[\"title\",\"description\"]' \
     --num_workers 11 \
     --cpu_optimizer false \

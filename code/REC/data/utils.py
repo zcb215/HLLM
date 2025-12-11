@@ -46,7 +46,7 @@ def bulid_dataloader(config, dataload):
 
     dataset_module = importlib.import_module('REC.data.dataset')
     train_set_name, test_set_name, collate_fn_name = dataset_dict[model_name]
-    # print(train_set_name)
+    print(f"collate_fn_name:{collate_fn_name}")
     # input()
     # 处理训练集的特殊配置（如HLLM）
     if isinstance(train_set_name, tuple):

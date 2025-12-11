@@ -8,6 +8,8 @@
 #
 # This modified file is released under the same license.
 
+
+
 import copy
 import pickle
 import os
@@ -66,7 +68,33 @@ class Data:
             self.logger.info(f'Item feature loaded successfully from [{item_data}].')
 
     def _data_processing(self):
-
+        # =========== 新增过滤代码开始 ===========
+        # 设定最小交互次数阈值
+        min_inter_num = 5
+        max_inter_num = 1000
+        
+        # 1. 统计每个用户的交互次数
+        user_counts = self.inter_feat['user_id'].value_counts()
+        
+        min_count = user_counts.min()
+        self.logger.info(f"The minimum interaction count per user is: {min_count}")
+        
+        # 2. 获取交互次数大于等于 5 的用户集合 ''' & (user_counts <= max_inter_num)'''
+        valid_users = user_counts[(user_counts >= min_inter_num)].index
+        
+        # 记录过滤前的数量用于对比
+        original_len = len(self.inter_feat)
+        
+        # 3. 过滤 self.inter_feat，只保留有效用户
+        self.inter_feat = self.inter_feat[self.inter_feat['user_id'].isin(valid_users)]
+        
+        # 4. 重置索引 (重要：保证后续 build 函数中使用 indices 访问时的对齐)
+        self.inter_feat = self.inter_feat.reset_index(drop=True)
+        
+        self.logger.info(f"Filter users iter  {min_inter_num} to {max_inter_num}.  "
+                         f"Interactions: {original_len} -> {len(self.inter_feat)}")
+        # =========== 新增过滤代码结束 ===========
+        # input()
         self.id2token = {}  # 索引 -> 原始ID
         self.token2id = {}  # 原始ID -> 索引
         remap_list = ['user_id', 'item_id']

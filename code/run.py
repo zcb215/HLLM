@@ -157,9 +157,9 @@ def run_loop(local_rank, config_file=None, saved=True, extra_args=[]):
     '''
 
     # get model and data
-    dataload = load_data(config)
+    dataload = load_data(config)  # 18G
     train_loader, valid_loader, test_loader = bulid_dataloader(config, dataload)
-    print(f"{len(train_loader) = }")
+    print(f"{len(train_loader) = }")  # 19G
 
     model = get_model(config['model'])(config, dataload)
     # model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
